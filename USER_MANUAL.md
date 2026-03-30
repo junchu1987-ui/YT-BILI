@@ -41,9 +41,9 @@
 
 | 软件 | 最低版本 | 用途 | 下载地址 |
 | :--- | :--- | :--- | :--- |
-| **Python** | 3.10+ | 核心运行环境 | [python.org](https://www.python.org/downloads/) |
-| **FFmpeg** | 任意 | 视频转码与合并 | [ffmpeg.org](https://ffmpeg.org/download.html) |
-| **Git** | 任意 | 代码版本管理 | [git-scm.com](https://git-scm.com/) |
+| **Python** | 3.10+ | 核心运行环境 | `setup.bat` 可自动安装 |
+| **FFmpeg** | 任意 | 视频转码与合并 | `setup.bat` 可自动安装 |
+| **Git** | 任意 | 代码版本管理 | `setup.bat` 可自动安装 |
 
 > [!IMPORTANT]
 > **FFmpeg 必须添加到系统环境变量 (PATH) 中**。安装后请在终端输入 `ffmpeg -version` 确认是否生效。
@@ -54,10 +54,14 @@
 
 ### 第一步：初始化环境
 双击运行项目根目录下的 **`setup.bat`**。
-该脚本会自动完成：
-- 创建 Python 虚拟环境 (`.venv`)。
-- 安装所有必要的 Python 依赖包。
-- 检查 `ffmpeg` 和 `bin\bun.exe` 是否准备就绪。
+该脚本非常强大，会自动完成：
+- **自动检测并安装**：如果您的电脑缺少 `Git`、`FFmpeg` 或 `Python 3.11`，脚本会通过 Windows `winget` 尝试自动安装它们。
+- **创建虚拟环境**：创建并配置 Python 虚拟环境 (`.venv`)。
+- **安装依赖包**：自动安装项目所需的所有 Python 库。
+- **检查环境**：确认一切就绪。
+
+> [!TIP]
+> 如果脚本安装了新工具（如 Git 或 FFmpeg），建议在脚本运行完后重启电脑或重新打开命令行窗口，以确保环境变量生效。
 
 ### 第二步：配置账号凭证 (Cookies)
 为了确保能成功下载 YouTube 4K 视频并上传至 B站，您需要手动准备两个 Cookie 文件：
