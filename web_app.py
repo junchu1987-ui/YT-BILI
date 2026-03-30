@@ -449,8 +449,14 @@ def start_transcode():
                 _set_progress(vid_id, 0, 'Starting transcode...')
 
                 try:
+                    last_log_pct = -1
                     def p_cb(p):
+                        nonlocal last_log_pct
                         _set_progress(vid_id, p, 'Transcoding...')
+                        # Log every 10% to avoid flooding
+                        if p // 10 > last_log_pct // 10:
+                            _log('info', f"[{vid_id}] Transcoding progress: {p}%")
+                            last_log_pct = p
 
                     final_path = processor.process(video, cancel_check=check_cancel, progress_cb=p_cb)
                     if final_path:
@@ -523,8 +529,14 @@ def start_upload():
                 _set_progress(vid_id, 0, 'Starting upload...')
 
                 try:
+                    last_log_pct = -1
                     def p_cb(p):
+                        nonlocal last_log_pct
                         _set_progress(vid_id, p, 'Uploading...')
+                        # Log every 10% to avoid flooding
+                        if p // 10 > last_log_pct // 10:
+                            _log('info', f"[{vid_id}] Upload progress: {p}%")
+                            last_log_pct = p
 
                     success = uploader.upload(
                         video_data=video,

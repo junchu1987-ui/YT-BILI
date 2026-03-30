@@ -45,6 +45,12 @@ document.addEventListener('change', e => {
             sizeEl.textContent = (size / 1024 / 1024).toFixed(1) + ' MB';
         }
     }
+    
+    // Sync to global state so it persists in the "Processing Progress" view
+    const candidate = S.candidates.find(c => c.id === vidId);
+    if (candidate) {
+        candidate.filesize = parseInt(size);
+    }
   }
 });
 

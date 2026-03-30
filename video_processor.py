@@ -202,18 +202,27 @@ class VideoProcessor:
             standardized_main = os.path.join(video_dir, "main_standardized.mp4")
             if not os.path.exists(standardized_main):
                 # We transcode the main video to H264/AAC matching the intro.
-                vf_args = []
-                if orig_h > 1080:
-                    vf_args = ['-vf', f'scale={target_w}:{target_h},setsar=1:1']
-                    
+                # Optimization: To maximize GPU usage and minimize CPU/RAM, 
+                # we use hwaccel for decoding and scale_cuda for hardware scaling.
                 cmd_nvenc = [
                     self.ffmpeg_path, '-y',
-                    '-i', filepath,
-                    *vf_args,
+                    '-hwaccel', 'cuda',
+                    '-hwaccel_output_format', 'cuda',
+                    '-i', filepath
+                ]
+                
+                # Filter chain for GPU-side scaling/format normalization
+                if orig_h > 1080:
+                    cmd_nvenc.extend(['-vf', f'scale_cuda={target_w}:{target_h},setsar=1:1'])
+                else:
+                    cmd_nvenc.extend(['-vf', 'scale_cuda=format=yuv420p,setsar=1:1'])
+                
+                cmd_nvenc.extend([
                     '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
                     '-c:a', 'aac',
                     standardized_main
-                ]
+                ])
+                
                 cmd_cpu = [
                     self.ffmpeg_path, '-y',
                     '-i', filepath,
