@@ -1,0 +1,43 @@
+# Media & Data
+data/
+*.mp4
+*.m4a
+*.part
+*.ytdl
+*.webp
+*.jpg
+*.jpeg
+*.png
+!static/
+!templates/
+!assets/
+
+# Logs & Temp
+*.log
+web_app.log
+download.log
+ds_update.log
+pipeline.log
+upload_error.log
+upload_error2.log
+__pycache__/
+*.tmp
+concat_list.txt
+intro_transcoded.mp4
+main_standardized.mp4
+
+# Environment & IDE
+.venv/
+.env
+.vscode/
+.idea/
+.agents/
+Antigravity.exe
+bun.exe
+deno.exe
+pyrightconfig.json
+
+# Bilibili session (Keep private)
+cookies.json
+youtube_cookies.txt
+qrcode.png
