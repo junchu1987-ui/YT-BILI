@@ -307,10 +307,14 @@ function renderVideoSection() {
     // Quality & Filesize
     let metaExtra = '';
     if (c.filesize) metaExtra += `<span class="video-filesize">${(c.filesize/1024/1024).toFixed(1)} MB</span>`;
-    if (showCheckbox && !isSkip && c.has_4k) {
-        metaExtra += `<select class="quality-selector" data-id="${c.id}" data-s1080="${c.size_1080p||0}" data-s4k="${c.size_4k||0}">
-            <option value="1080p">1080p自动</option>
-            <option value="4k">4K原画</option>
+    if (showCheckbox && !isSkip) {
+        // ALWAYS show selector so the user can verify quality before downloading.
+        // If 4K size data exists, use it, otherwise fallback to default.
+        const s1080 = c.size_1080p || c.filesize || 0;
+        const s4k = c.size_4k || s1080;
+        metaExtra += `<select class="quality-selector" data-id="${c.id}" data-s1080="${s1080}" data-s4k="${s4k}">
+            <option value="1080p" ${c.quality!=='4k'?'selected':''}>1080p</option>
+            <option value="4k" ${c.quality==='4k'?'selected':''}>4K/HighRes</option>
         </select>`;
     }
 

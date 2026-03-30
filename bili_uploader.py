@@ -54,6 +54,23 @@ class BilibiliUploader:
         
         logging.info(f"Uploading to Bilibili: {title}")
         
+        # Dynamic Tags: Extract from metadata, merge with defaults, and sanitize.
+        # Bilibili limits: max 10 tags, max 20 chars per tag.
+        meta_tags = video_data.get('tags', []) or []
+        base_tags = ['YouTube', '创意']
+        combined_tags = []
+        seen = set()
+        for t in base_tags + meta_tags:
+            t_clean = str(t).strip()[:20]
+            if t_clean and t_clean not in seen:
+                combined_tags.append(t_clean)
+                seen.add(t_clean)
+            if len(combined_tags) >= 10: break
+            
+        tag_str = ','.join(combined_tags)
+        
+        logging.info(f"Uploading to Bilibili: {title} with tags: {tag_str}")
+        
         cmd = [
             'biliup',
             'upload',
@@ -61,9 +78,8 @@ class BilibiliUploader:
             '--title', title,
             '--desc', full_desc,
             '--tid', str(self.tid),
-            '--copyright', '2',
-            '--source', youtube_url,
-            '--tag', 'YouTube,搬运'
+            '--copyright', '1',
+            '--tag', tag_str
         ]
         
         # Attach cover image if available
@@ -113,11 +129,12 @@ class BilibiliUploader:
             def log_reader(pipe):
                 try:
                     for line in pipe:
-                        line = line.strip()
+                        # Clean ANSI escape codes (biliup output often includes them)
+                        line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
                         if line:
                             logging.info(f"[biliup] {line}")
                             
-                            # Extract percentage if present (e.g. "55.5%" or "55%")
+                            # Extract percentage: watch for "50.0%" or "50%" or "[50%]"
                             if progress_cb:
                                 match = re.search(r'(\d+(?:\.\d+)?)%', line)
                                 if match:

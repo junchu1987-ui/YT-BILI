@@ -153,22 +153,23 @@ class YouTubeDownloader:
                 has_4k = False
                 
                 formats = entry.get('formats', [])
-                # Sort formats by total size if possible
                 for f in formats:
                     h = f.get('height')
+                    if h is None: continue
                     fsize = f.get('filesize') or f.get('filesize_approx') or 0
-                    if not h: continue
                     
                     if h <= 1080:
                         size_1080p = max(size_1080p, fsize)
-                    if h >= 2160:
+                    if h > 1080:
                         size_4k = max(size_4k, fsize)
                         has_4k = True
                 
-                # If the main entry has a filesize, use it as fallback for 1080p
+                # Fallback: if no specific format sizing found, use root filesize
                 root_fs = entry.get('filesize') or entry.get('filesize_approx') or 0
-                if root_fs > size_1080p:
+                if root_fs > size_1080p and not has_4k:
                     size_1080p = root_fs
+                if root_fs > size_4k and has_4k:
+                    size_4k = root_fs
                 
                 candidates.append({
                     'id': v_id,
@@ -182,7 +183,8 @@ class YouTubeDownloader:
                     'has_4k': has_4k,
                     'size_1080p': size_1080p,
                     'size_4k': size_4k,
-                    'filesize': size_1080p # Default
+                    'filesize': size_1080p, # Default visible
+                    'quality': '1080p'    # Default quality
                 })
 
         logging.info(f"Scan complete: {len(candidates)} videos found, "

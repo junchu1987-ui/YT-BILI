@@ -12,7 +12,7 @@ ffmpeg:
   bin_path: ffmpeg
   intro_video_path: ./assets/intro.mp4
 bilibili:
-  tid: 176
+  tid: 233
   desc_prefix: '本视频搬运自YouTube。
 
     原视频链接：{youtube_url}

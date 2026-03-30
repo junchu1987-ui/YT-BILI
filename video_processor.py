@@ -137,10 +137,13 @@ class VideoProcessor:
         fps = main_video_info.get('fps', '30000/1001')
         
         # We enforce h264 and aac for broad compatibility and seamless merging
+        # Using scale_cuda for GPU-side scaling if possible
         cmd_nvenc = [
             self.ffmpeg_path, '-y',
+            '-hwaccel', 'cuda',
+            '-hwaccel_output_format', 'cuda',
             '-i', self.intro_path,
-            '-vf', f'scale={width}:{height},setsar=1:1',
+            '-vf', f'scale_cuda={width}:{height},setsar=1:1',
             '-r', str(fps),
             '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
             '-c:a', 'aac', '-ar', '44100',
@@ -180,86 +183,62 @@ class VideoProcessor:
             logging.error("Cannot proceed without main video info.")
             return None
             
-        # Ensure we never transcode higher than 1080p (fixes H264 NVENC crashes on 4K)
-        orig_w = main_info.get('width') or 1920
-        orig_h = main_info.get('height') or 1080
-        if orig_h > 1080:
-            target_h = 1080
-            target_w = int(orig_w * (1080 / orig_h))
-            if target_w % 2 != 0: target_w -= 1
-            main_info['width'] = target_w
-            main_info['height'] = target_h
-            logging.info(f"Target transcode resolution capped to {target_w}x{target_h}")
-        else:
-            target_w, target_h = orig_w, orig_h
+        # Resolution Logic: Resolution-matching (4K stays 4K, 1080p stays 1080p)
+        target_w = main_info.get('width') or 1920
+        target_h = main_info.get('height') or 1080
             
         # Optional Step 2: Transcode Intro to match main video
         prepared_intro = self._transcode_intro(main_info, self.work_dir, cancel_check)
         
-        # Step 3: Concat
-        if prepared_intro:
-            logging.info("Standardizing main video to H264 for safe concatenation...")
-            standardized_main = os.path.join(video_dir, "main_standardized.mp4")
-            if not os.path.exists(standardized_main):
-                # We transcode the main video to H264/AAC matching the intro.
-                # Optimization: To maximize GPU usage and minimize CPU/RAM, 
-                # we use hwaccel for decoding and scale_cuda for hardware scaling.
-                cmd_nvenc = [
-                    self.ffmpeg_path, '-y',
-                    '-hwaccel', 'cuda',
-                    '-hwaccel_output_format', 'cuda',
-                    '-i', filepath
-                ]
-                
-                # Filter chain for GPU-side scaling/format normalization
-                if orig_h > 1080:
-                    cmd_nvenc.extend(['-vf', f'scale_cuda={target_w}:{target_h},setsar=1:1'])
-                else:
-                    cmd_nvenc.extend(['-vf', 'scale_cuda=format=yuv420p,setsar=1:1'])
-                
-                cmd_nvenc.extend([
-                    '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
-                    '-c:a', 'aac',
-                    standardized_main
-                ])
-                
-                cmd_cpu = [
-                    self.ffmpeg_path, '-y',
-                    '-i', filepath,
-                    *vf_args,
-                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                    '-c:a', 'aac',
-                    standardized_main
-                ]
-                
-                if not self._run_ffmpeg_with_fallback(cmd_nvenc, cmd_cpu, cancel_check, progress_cb, main_info.get('duration_us')):
-                    return None
+        # Step 3: Standardize Main Video (always, to ensure H264/AAC compatibility)
+        logging.info(f"Standardizing main video ({target_w}x{target_h}) to H264/AAC...")
+        standardized_main = os.path.join(video_dir, "main_standardized.mp4")
+        if not os.path.exists(standardized_main):
+            # To maximize GPU usage and minimize CPU/RAM, 
+            # we use hwaccel for decoding and scale_cuda for hardware scaling/conversion.
+            cmd_nvenc = [
+                self.ffmpeg_path, '-y',
+                '-hwaccel', 'cuda',
+                '-hwaccel_output_format', 'cuda',
+                '-i', filepath,
+                '-vf', 'scale_cuda=format=yuv420p,setsar=1:1',
+                '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
+                '-c:a', 'aac',
+                standardized_main
+            ]
+            
+            cmd_cpu = [
+                self.ffmpeg_path, '-y',
+                '-i', filepath,
+                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                '-c:a', 'aac',
+                standardized_main
+            ]
+            
+            if not self._run_ffmpeg_with_fallback(cmd_nvenc, cmd_cpu, cancel_check, progress_cb, main_info.get('duration_us')):
+                return None
 
+        # Step 4: Concat if intro exists, else standardized_main is our final result
+        if prepared_intro:
             list_file_path = os.path.join(video_dir, 'concat_list.txt')
             with open(list_file_path, 'w', encoding='utf-8') as f:
                 f.write(f"file '{os.path.abspath(prepared_intro).replace(os.sep, '/')}'\n")
                 f.write(f"file '{os.path.abspath(standardized_main).replace(os.sep, '/')}'\n")
                 
             logging.info("Merging intro and main video...")
-            # Now that both are strictly H264/AAC, we can safely and instantly use concat stream copy.
+            # Stream copy for instant result
             cmd_concat = [
-                self.ffmpeg_path,
-                '-y',
-                '-f', 'concat',
-                '-safe', '0',
-                '-i', list_file_path,
-                '-c', 'copy',
-                final_output
+                self.ffmpeg_path, '-y', '-f', 'concat', '-safe', '0',
+                '-i', list_file_path, '-c', 'copy', final_output
             ]
             try:
-                self._run_proc(cmd_concat, cancel_check) # Concat is almost instant usually
-                logging.info(f"Final video generated: {final_output}")
-                return final_output
+                self._run_proc(cmd_concat, cancel_check)
             except Exception as e:
-                if "cancelled" in str(e).lower():
-                    raise
-                logging.error(f"Concatenation failed: {e}")
+                logging.error(f"Concat failed: {e}")
                 return None
         else:
-            logging.info("No intro prepended. Using original file as final.")
-            return filepath
+            logging.info("No intro prepended. Final output is the standardized version.")
+            import shutil
+            shutil.copy2(standardized_main, final_output)
+            
+        return final_output
