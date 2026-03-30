@@ -5,9 +5,9 @@ app:
   port: 5000
 youtube:
   sources:
-  - url: https://www.youtube.com/watch?v=dy5fOGqajeI
-    type: video
-    title: I spent 2 weeks restoring this chair
+  - url: https://www.youtube.com/watch?v=PpjP_BX5rYE&list=PL1SlIrw0BFdWvS_caZufplFSRF5KhsyVU&index=6
+    type: playlist
+    title: KTM Big Single Project
 ffmpeg:
   bin_path: ffmpeg
   intro_video_path: ./assets/intro.mp4

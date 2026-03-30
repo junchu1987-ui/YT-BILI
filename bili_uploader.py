@@ -25,25 +25,32 @@ class BilibiliUploader:
         youtube_url = video_data.get('youtube_url', '')
         raw_desc = video_data.get('description', '') or ''
 
-        # --- Auto Translation (No-Key) ---
-        try:
-            import translators as ts
-            if title and title != 'Unknown Title':
-                logging.info(f"Translating Title via [bing]...")
-                trans_title = ts.translate_text(title, translator='bing', to_language='zh-Hans')
-                if trans_title:
-                    logging.info(f"Translated Title: {trans_title}")
-                    title = trans_title
+        # --- Auto Translation (With Timeout) ---
+        def translate_with_timeout(text, timeout=10):
+            try:
+                import translators as ts
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(ts.translate_text, text, translator='bing', to_language='zh-Hans')
+                    return future.result(timeout=timeout)
+            except Exception as e:
+                logging.warning(f"Translation skip (timeout or error: {e})")
+                return None
 
-            if raw_desc:
-                logging.info(f"Translating Description via [bing]...")
-                short_desc = raw_desc[:400]
-                trans_desc = ts.translate_text(short_desc, translator='bing', to_language='zh-Hans')
-                if trans_desc:
-                    logging.info("Translated Description successfully.")
-                    raw_desc = trans_desc
-        except Exception as e:
-            logging.warning(f"Translation failed (fallback to original English): {e}")
+        if title and title != 'Unknown Title':
+            logging.info(f"Translating Title via [bing] (10s timeout)...")
+            trans_title = translate_with_timeout(title)
+            if trans_title:
+                logging.info(f"Translated Title: {trans_title}")
+                title = trans_title
+
+        if raw_desc:
+            logging.info(f"Translating Description via [bing] (10s timeout)...")
+            short_desc = raw_desc[:400]
+            trans_desc = translate_with_timeout(short_desc)
+            if trans_desc:
+                logging.info("Translated Description successfully.")
+                raw_desc = trans_desc
 
         # Ensure length limits
         title = title[:80]

@@ -14,7 +14,7 @@ import time
 from datetime import datetime
 
 # ── Resolve bun path before any yt-dlp import ──────────────────────────────
-_BUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bun.exe')
+_BUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'bun.exe')
 
 from flask import Flask, render_template, jsonify, request, Response, stream_with_context
 import yaml
@@ -616,12 +616,16 @@ if __name__ == '__main__':
     host = cfg['app'].get('host', '127.0.0.1')
     port = int(cfg['app'].get('port', 5000))
 
+    # Ensure logs directory exists
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
             logging.StreamHandler(sys.stdout),
-            logging.FileHandler('web_app.log', encoding='utf-8'),
+            logging.FileHandler(os.path.join(log_dir, 'web_app.log'), encoding='utf-8'),
         ]
     )
 

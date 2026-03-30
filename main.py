@@ -7,7 +7,7 @@ import sys
 import subprocess
 
 # PRE-IMPORT: resolve bun.exe absolute path before yt-dlp is loaded
-_BUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bun.exe')
+_BUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'bun.exe')
 
 import yaml
 import logging
@@ -15,12 +15,16 @@ from yt_downloader import YouTubeDownloader
 from video_processor import VideoProcessor
 from bili_uploader import BilibiliUploader
 
+# Ensure logs directory exists
+log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+os.makedirs(log_dir, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler('pipeline.log', encoding='utf-8'),
+        logging.FileHandler(os.path.join(log_dir, 'pipeline.log'), encoding='utf-8'),
     ]
 )
 

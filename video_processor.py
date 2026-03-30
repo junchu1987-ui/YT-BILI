@@ -65,26 +65,36 @@ class VideoProcessor:
             raise subprocess.CalledProcessError(proc.returncode, cmd, output="".join(output).encode('utf-8'))
         return True
 
-    def _run_ffmpeg_with_fallback(self, cmd_nvenc, cmd_cpu, cancel_check=None, progress_cb=None, duration_us=None):
+    def _run_ffmpeg_with_fallback(self, cmd_nvenc_full, cmd_nvenc_hybrid, cmd_cpu, cancel_check=None, progress_cb=None, duration_us=None):
         def inject_progress_flags(cmd):
-            # Insert -progress and -nostats just before the output path (last arg)
             return cmd[:-1] + ['-progress', 'pipe:1', '-nostats'] + [cmd[-1]]
 
         if self.has_nvenc:
+            # STAGE 1: Full GPU (Zero-Copy)
             try:
-                self._run_proc(inject_progress_flags(cmd_nvenc), cancel_check, progress_cb, duration_us)
+                logging.info("Attempting Full GPU Transcoding (Zero-Copy)...")
+                self._run_proc(inject_progress_flags(cmd_nvenc_full), cancel_check, progress_cb, duration_us)
                 return True
             except Exception as e:
-                if "cancelled" in str(e).lower():
-                    raise
-                err = str(e)
-                logging.warning(f"NVENC encoding failed (driver issue?), falling back to CPU. Error snippet: {err[-200:]}")
+                if "cancelled" in str(e).lower(): raise
+                logging.warning(f"Full GPU failed, attempting Hybrid GPU... Error: {str(e)[-100:]}")
+            
+            # STAGE 2: Hybrid GPU (CPU Decode -> GPU Scale/Encode)
+            try:
+                logging.info("Attempting Hybrid GPU Transcoding (CPU Decode + GPU Scale/Encode)...")
+                self._run_proc(inject_progress_flags(cmd_nvenc_hybrid), cancel_check, progress_cb, duration_us)
+                return True
+            except Exception as e:
+                if "cancelled" in str(e).lower(): raise
+                logging.warning(f"Hybrid GPU failed, falling back to CPU... Error: {str(e)[-100:]}")
+
+        # STAGE 3: Full CPU (Legacy)
         try:
+            logging.info("Using CPU Transcoding (Legacy Fallback)...")
             self._run_proc(inject_progress_flags(cmd_cpu), cancel_check, progress_cb, duration_us)
             return True
         except Exception as e:
-            if "cancelled" in str(e).lower():
-                raise
+            if "cancelled" in str(e).lower(): raise
             logging.error(f"FFmpeg CPU encoding failed: {e}")
             return False
 
@@ -137,18 +147,32 @@ class VideoProcessor:
         fps = main_video_info.get('fps', '30000/1001')
         
         # We enforce h264 and aac for broad compatibility and seamless merging
-        # Using scale_cuda for GPU-side scaling if possible
-        cmd_nvenc = [
+        # STAGE 1: Full GPU (Zero-Copy)
+        cmd_nvenc_full = [
             self.ffmpeg_path, '-y',
             '-hwaccel', 'cuda',
             '-hwaccel_output_format', 'cuda',
             '-i', self.intro_path,
-            '-vf', f'scale_cuda={width}:{height},setsar=1:1',
+            '-vf', f'scale_cuda={width}:{height}:format=nv12',
             '-r', str(fps),
             '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
             '-c:a', 'aac', '-ar', '44100',
             transcoded_intro_path
         ]
+        
+        # STAGE 2: Hybrid GPU (CPU Decode + GPU Scale/Encode)
+        # More robust if hwaccel_output_format cuda fails for specific sources
+        cmd_nvenc_hybrid = [
+            self.ffmpeg_path, '-y',
+            '-i', self.intro_path,
+            '-vf', f'hwupload_cuda,scale_cuda={width}:{height}:format=nv12',
+            '-r', str(fps),
+            '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
+            '-c:a', 'aac', '-ar', '44100',
+            transcoded_intro_path
+        ]
+
+        # STAGE 3: Full CPU
         cmd_cpu = [
             self.ffmpeg_path, '-y',
             '-i', self.intro_path,
@@ -159,10 +183,16 @@ class VideoProcessor:
             transcoded_intro_path
         ]
         
-        if self._run_ffmpeg_with_fallback(cmd_nvenc, cmd_cpu, cancel_check):
-            return transcoded_intro_path
-        else:
-            return None
+        try:
+            if self._run_ffmpeg_with_fallback(cmd_nvenc_full, cmd_nvenc_hybrid, cmd_cpu, cancel_check):
+                return transcoded_intro_path
+        except Exception as e:
+            logging.error(f"Intro transcode failed: {e}. Cleaning up partial file...")
+            if os.path.exists(transcoded_intro_path):
+                try: os.remove(transcoded_intro_path)
+                except: pass
+            raise
+        return None
 
     def process(self, video_data, cancel_check=None, progress_cb=None):
         """
@@ -193,52 +223,72 @@ class VideoProcessor:
         # Step 3: Standardize Main Video (always, to ensure H264/AAC compatibility)
         logging.info(f"Standardizing main video ({target_w}x{target_h}) to H264/AAC...")
         standardized_main = os.path.join(video_dir, "main_standardized.mp4")
-        if not os.path.exists(standardized_main):
-            # To maximize GPU usage and minimize CPU/RAM, 
-            # we use hwaccel for decoding and scale_cuda for hardware scaling/conversion.
-            cmd_nvenc = [
-                self.ffmpeg_path, '-y',
-                '-hwaccel', 'cuda',
-                '-hwaccel_output_format', 'cuda',
-                '-i', filepath,
-                '-vf', 'scale_cuda=format=yuv420p,setsar=1:1',
-                '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
-                '-c:a', 'aac',
-                standardized_main
-            ]
-            
-            cmd_cpu = [
-                self.ffmpeg_path, '-y',
-                '-i', filepath,
-                '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-c:a', 'aac',
-                standardized_main
-            ]
-            
-            if not self._run_ffmpeg_with_fallback(cmd_nvenc, cmd_cpu, cancel_check, progress_cb, main_info.get('duration_us')):
-                return None
-
-        # Step 4: Concat if intro exists, else standardized_main is our final result
-        if prepared_intro:
-            list_file_path = os.path.join(video_dir, 'concat_list.txt')
-            with open(list_file_path, 'w', encoding='utf-8') as f:
-                f.write(f"file '{os.path.abspath(prepared_intro).replace(os.sep, '/')}'\n")
-                f.write(f"file '{os.path.abspath(standardized_main).replace(os.sep, '/')}'\n")
+        
+        try:
+            if not os.path.exists(standardized_main):
+                # STAGE 1: Full GPU (Zero-Copy)
+                cmd_nvenc_full = [
+                    self.ffmpeg_path, '-y',
+                    '-hwaccel', 'cuda',
+                    '-hwaccel_output_format', 'cuda',
+                    '-i', filepath,
+                    '-vf', f'scale_cuda={target_w}:{target_h}:format=nv12',
+                    '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
+                    '-c:a', 'aac',
+                    standardized_main
+                ]
                 
-            logging.info("Merging intro and main video...")
-            # Stream copy for instant result
-            cmd_concat = [
-                self.ffmpeg_path, '-y', '-f', 'concat', '-safe', '0',
-                '-i', list_file_path, '-c', 'copy', final_output
-            ]
-            try:
+                # STAGE 2: Hybrid GPU (Safe decode + GPU Scale/Encode)
+                cmd_nvenc_hybrid = [
+                    self.ffmpeg_path, '-y',
+                    '-i', filepath,
+                    '-vf', f'hwupload_cuda,scale_cuda={target_w}:{target_h}:format=nv12',
+                    '-c:v', 'h264_nvenc', '-preset', 'p6', '-rc', 'vbr', '-cq', '24', '-b:v', '0',
+                    '-c:a', 'aac',
+                    standardized_main
+                ]
+
+                # STAGE 3: Full CPU Fallback
+                cmd_cpu = [
+                    self.ffmpeg_path, '-y',
+                    '-i', filepath,
+                    '-vf', f'scale={target_w}:{target_h},setsar=1:1',
+                    '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
+                    '-c:a', 'aac',
+                    standardized_main
+                ]
+                
+                if not self._run_ffmpeg_with_fallback(cmd_nvenc_full, cmd_nvenc_hybrid, cmd_cpu, cancel_check, progress_cb, main_info.get('duration_us')):
+                    raise Exception("Transcoding failed across all stages.")
+
+            # Step 4: Concat if intro exists, else standardized_main is our final result
+            if prepared_intro:
+                list_file_path = os.path.join(video_dir, 'concat_list.txt')
+                with open(list_file_path, 'w', encoding='utf-8') as f:
+                    # Escape paths for ffmpeg concat list
+                    f.write(f"file '{os.path.abspath(prepared_intro).replace(os.sep, '/')}'\n")
+                    f.write(f"file '{os.path.abspath(standardized_main).replace(os.sep, '/')}'\n")
+                    
+                logging.info("Merging intro and main video...")
+                cmd_concat = [
+                    self.ffmpeg_path, '-y', '-f', 'concat', '-safe', '0',
+                    '-i', list_file_path, '-c', 'copy', final_output
+                ]
                 self._run_proc(cmd_concat, cancel_check)
-            except Exception as e:
-                logging.error(f"Concat failed: {e}")
-                return None
-        else:
-            logging.info("No intro prepended. Final output is the standardized version.")
-            import shutil
-            shutil.copy2(standardized_main, final_output)
-            
-        return final_output
+            else:
+                logging.info("No intro prepended. Final output is copy of standardized version.")
+                import shutil
+                shutil.copy2(standardized_main, final_output)
+                
+            return final_output
+
+        except Exception as e:
+            # CLEANUP: Remove partial files on failure or cancellation
+            logging.error(f"Processing interrupted: {e}. Cleaning up partial files...")
+            for f in [standardized_main, final_output]:
+                if os.path.exists(f):
+                    try: 
+                        os.remove(f)
+                        logging.info(f"Cleaned up partial file: {f}")
+                    except: pass
+            raise # Ensure the runner receives the exception to update task status

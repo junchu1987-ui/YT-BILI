@@ -14,28 +14,27 @@ data/
 
 # Logs & Temp
 *.log
-web_app.log
-download.log
-ds_update.log
-pipeline.log
-upload_error.log
-upload_error2.log
+logs/
 __pycache__/
 *.tmp
 concat_list.txt
 intro_transcoded.mp4
 main_standardized.mp4
 
-# Environment & IDE
+# Python
 .venv/
 .env
+
+# IDE
 .vscode/
 .idea/
 .agents/
+pyrightconfig.json
+
+# Binaries
 Antigravity.exe
 bun.exe
 deno.exe
-pyrightconfig.json
 
 # Bilibili session (Keep private)
 cookies.json
