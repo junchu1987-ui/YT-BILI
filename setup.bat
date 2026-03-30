@@ -50,14 +50,14 @@ if errorlevel 1 (
 )
 
 :: Check bun.exe
-if not exist "bun.exe" (
+if not exist "bin\bun.exe" (
     echo.
-    echo [WARN] bun.exe not found.
+    echo [WARN] bin\bun.exe not found.
     echo        Download bun-windows-x64.zip from: https://github.com/oven-sh/bun/releases
-    echo        Extract bun.exe into this folder.
+    echo        Create a 'bin' folder and extract bun.exe into it.
     echo.
 ) else (
-    echo [OK] bun.exe detected.
+    echo [OK] bin\bun.exe detected.
 )
 
 :: Check cookies
