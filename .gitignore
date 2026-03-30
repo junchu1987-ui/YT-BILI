@@ -32,6 +32,7 @@ main_standardized.mp4
 pyrightconfig.json
 
 # Binaries
+bin/
 Antigravity.exe
 bun.exe
 deno.exe

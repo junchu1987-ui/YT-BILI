@@ -278,6 +278,7 @@ def reset_pipeline():
             _log('info', "Deleted history.json")
             
         # Clean up temporary/broken yt-dlp fragments & concat files
+        # We explicitly preserve *_final.mp4 as requested by user for retry efficiency
         for pattern in ('*.part', '*.ytdl', 'concat_list.txt', 'main_standardized.mp4', 'intro_transcoded.mp4', '*.temp.mp4'):
             for p in glob.glob(os.path.join(work_dir, '**', pattern), recursive=True):
                 try: 
@@ -582,6 +583,88 @@ def start_upload():
             _cancel_requested = False
 
     threading.Thread(target=run, daemon=True).start()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/retry', methods=['POST'])
+def start_retry():
+    """Retry upload or transcode for a specific video_id."""
+    video_id = request.json.get('video_id')
+    if not video_id:
+        return jsonify({'error': 'video_id required'}), 400
+
+    # Find the video in candidates/downloaded
+    video = None
+    with _state_lock:
+        for v in _pipeline.get('downloaded', []):
+            if v['id'] == video_id:
+                video = v
+                break
+        if not video:
+            for v in _pipeline.get('candidates', []):
+                if v['id'] == video_id:
+                    video = v
+                    break
+                
+    if not video:
+        return jsonify({'error': f'Video {video_id} not found'}), 404
+
+    _log('info', f"Retrying process for {video_id}...")
+    
+    def run_retry():
+        global _cancel_requested
+        try:
+            cfg = load_config()
+            processor = VideoProcessor(cfg)
+            downloader = YouTubeDownloader(cfg)
+            uploader = BilibiliUploader(cfg)
+
+            with _state_lock:
+                _pipeline['current_video'] = video_id
+
+            # 1. Ensure transcode is done (this skips if file exists due to our new VideoProcessor logic)
+            _set_progress(video_id, 0, 'Checking transcode...')
+            final_path = processor.process(video, cancel_check=check_cancel)
+            
+            if not final_path:
+                _log('error', f"[{video_id}] Retry: Transcode check failed")
+                _set_progress(video_id, 0, 'Transcode check FAILED')
+                return
+
+            video['final_path'] = final_path
+            _set_progress(video_id, 50, 'Transcode ready, starting upload...')
+
+            # 2. Upload
+            success = uploader.upload(
+                video_data=video,
+                final_video_path=final_path,
+                cancel_check=check_cancel,
+                progress_cb=lambda p: _set_progress(video_id, 50 + int(p/2), 'Uploading (retry)...')
+            )
+
+            if success:
+                downloader.save_history(video_id)
+                _set_progress(video_id, 100, 'Upload complete ✓ (Retry)')
+                _log('info', f"[{video_id}] ✓ Retry successful. Added to history.")
+                with _state_lock:
+                    # Remove from errors if present
+                    _pipeline['errors'] = [e for e in _pipeline['errors'] if e.get('id') != video_id]
+                    if video not in _pipeline['uploaded']:
+                        _pipeline['uploaded'].append(video)
+            else:
+                _log('error', f"[{video_id}] ✗ Retry upload failed")
+                _set_progress(video_id, 0, 'Retry FAILED')
+
+        except Exception as e:
+            _log('error', f"[{video_id}] Retry error: {e}")
+            _set_progress(video_id, 0, f'Error: {str(e)[:20]}...')
+        finally:
+            with _state_lock:
+                _pipeline['current_video'] = None
+            _cancel_requested = False
+            _emit('state', {'status': 'done'})
+
+    threading.Thread(target=run_retry, daemon=True).start()
     return jsonify({'ok': True})
 
 

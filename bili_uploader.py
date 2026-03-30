@@ -11,6 +11,21 @@ class BilibiliUploader:
             'desc_prefix',
             '本视频搬运自YouTube。\n原视频链接：{youtube_url}\n\n'
         )
+        self.biliup_path = self._get_executable_path('biliup')
+        self.ffmpeg_path = self._get_executable_path('ffmpeg')
+
+    def _get_executable_path(self, name):
+        """Finds the absolute path of an executable, prioritizing the venv Scripts folder."""
+        import sys
+        import shutil
+        # Check venv Scripts/bin first
+        scripts_dir = os.path.join(sys.prefix, 'Scripts') if os.name == 'nt' else os.path.join(sys.prefix, 'bin')
+        ext = ".exe" if os.name == 'nt' else ""
+        exe_path = os.path.join(scripts_dir, f"{name}{ext}")
+        if os.path.exists(exe_path):
+            return exe_path
+        # Fallback to system PATH
+        return shutil.which(name) or name
 
     def upload(self, video_data, final_video_path, cancel_check=None, progress_cb=None):
         """
@@ -79,7 +94,7 @@ class BilibiliUploader:
         logging.info(f"Uploading to Bilibili: {title} with tags: {tag_str}")
         
         cmd = [
-            'biliup',
+            self.biliup_path,
             'upload',
             final_video_path,
             '--title', title,
@@ -98,7 +113,7 @@ class BilibiliUploader:
                 jpg_cover = cover_path.rsplit('.', 1)[0] + '.jpg'
                 if not os.path.exists(jpg_cover):
                     # Quickly strip the webp format into standard jpeg
-                    subprocess.run(['ffmpeg', '-y', '-i', cover_path, jpg_cover], 
+                    subprocess.run([self.ffmpeg_path, '-y', '-i', cover_path, jpg_cover], 
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
                 
                 if os.path.exists(jpg_cover):

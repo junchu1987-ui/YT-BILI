@@ -390,6 +390,17 @@ code {
   border-radius: 4px; transition: background .15s;
 }
 .btn-tiny:hover { background: var(--bg3); }
+.btn-retry {
+  background: var(--accent);
+  color: #fff;
+  border: none;
+  border-radius: 4px;
+  font-size: 10px;
+  padding: 2px 8px;
+  cursor: pointer;
+  transition: background .15s;
+}
+.btn-retry:hover { background: var(--accent-dim); }
 
 /* ── Empty state ────────────────────────────────────────────── */
 .empty-state { color: var(--text2); font-size: 13px; padding: 20px 0; }

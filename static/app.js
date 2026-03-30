@@ -288,7 +288,11 @@ function renderVideoSection() {
 
     let statusBadge = '';
     if (isUploaded) statusBadge = `<span class="badge badge-done">已上传</span>`;
-    else if (errEntry) statusBadge = `<span class="badge badge-fail">${errEntry.step} 失败</span>`;
+    else if (errEntry) statusBadge = `
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+        <span class="badge badge-fail">${errEntry.step} 失败</span>
+        <button class="btn-retry" onclick="doRetry('${c.id}')">重试</button>
+      </div>`;
     else if (isTranscoded) statusBadge = `<span class="badge badge-done">转码✓</span>`;
     else if (isDownloaded) statusBadge = `<span class="badge badge-done">下载✓</span>`;
     else if (isSkip) statusBadge = `<span class="badge badge-skip">已有</span>`;
@@ -379,6 +383,7 @@ async function doDownload() {
 async function doTranscode() { await api('POST', '/api/transcode'); }
 async function doUpload()    { await api('POST', '/api/upload'); }
 async function doReset()     { await api('POST', '/api/reset'); }
+async function doRetry(id)     { await api('POST', '/api/retry', { video_id: id }); }
 
 // ── Sources tab ───────────────────────────────────────────────────────────────
 async function loadSources() {

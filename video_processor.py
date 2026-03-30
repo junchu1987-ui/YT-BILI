@@ -203,6 +203,11 @@ class VideoProcessor:
         video_dir = os.path.dirname(filepath)
         final_output = os.path.join(video_dir, f"{video_id}_final.mp4")
         
+        if os.path.exists(final_output):
+            logging.info(f"Final video already exists: {final_output}. Skipping transcoding.")
+            if progress_cb: progress_cb(100)
+            return final_output
+
         if not os.path.exists(filepath):
             logging.error(f"Main video file not found: {filepath}")
             return None
