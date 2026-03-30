@@ -29,6 +29,25 @@ document.querySelectorAll('.nav-link').forEach(link => {
   });
 });
 
+// Quality selector dynamic size update
+document.addEventListener('change', e => {
+  if (e.target.classList.contains('quality-selector')) {
+    const sel = e.target;
+    const vidId = sel.dataset.id;
+    const val = sel.value;
+    const size = val === '4k' ? sel.dataset.s4k : sel.dataset.s1080;
+    
+    // Find video item and update the size display
+    const videoItem = document.getElementById('vi-' + vidId);
+    if (videoItem) {
+        const sizeEl = videoItem.querySelector('.video-filesize');
+        if (sizeEl) {
+            sizeEl.textContent = (size / 1024 / 1024).toFixed(1) + ' MB';
+        }
+    }
+  }
+});
+
 // ── SSE connection ────────────────────────────────────────────────────────────
 function connectSSE() {
   const es = new EventSource('/events');
@@ -283,7 +302,7 @@ function renderVideoSection() {
     let metaExtra = '';
     if (c.filesize) metaExtra += `<span class="video-filesize">${(c.filesize/1024/1024).toFixed(1)} MB</span>`;
     if (showCheckbox && !isSkip && c.has_4k) {
-        metaExtra += `<select class="quality-selector" data-id="${c.id}">
+        metaExtra += `<select class="quality-selector" data-id="${c.id}" data-s1080="${c.size_1080p||0}" data-s4k="${c.size_4k||0}">
             <option value="1080p">1080p自动</option>
             <option value="4k">4K原画</option>
         </select>`;

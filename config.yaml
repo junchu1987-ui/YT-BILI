@@ -8,6 +8,9 @@ youtube:
   - url: https://www.youtube.com/watch?v=paA9Z0-_Cao
     type: video
     title: RARE 56 YEAR OLD FLAIL MOWER RESTORATION
+  - url: https://www.youtube.com/watch?v=Z1XdDub8FKc
+    type: video
+    title: 1960 Perpetual Calendar 📆 Restoration
 ffmpeg:
   bin_path: ffmpeg
   intro_video_path: ./assets/intro.mp4
