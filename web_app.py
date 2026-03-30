@@ -449,7 +449,10 @@ def start_transcode():
                 _set_progress(vid_id, 0, 'Starting transcode...')
 
                 try:
-                    final_path = processor.process(video, cancel_check=check_cancel)
+                    def p_cb(p):
+                        _set_progress(vid_id, p, 'Transcoding...')
+
+                    final_path = processor.process(video, cancel_check=check_cancel, progress_cb=p_cb)
                     if final_path:
                         video_out = dict(video)
                         video_out['final_path'] = final_path
@@ -520,10 +523,14 @@ def start_upload():
                 _set_progress(vid_id, 0, 'Starting upload...')
 
                 try:
+                    def p_cb(p):
+                        _set_progress(vid_id, p, 'Uploading...')
+
                     success = uploader.upload(
                         video_data=video,
                         final_video_path=final_path,
-                        cancel_check=check_cancel
+                        cancel_check=check_cancel,
+                        progress_cb=p_cb
                     )
                     if success:
                         downloader.save_history(vid_id)

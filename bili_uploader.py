@@ -12,7 +12,7 @@ class BilibiliUploader:
             '本视频搬运自YouTube。\n原视频链接：{youtube_url}\n\n'
         )
 
-    def upload(self, video_data, final_video_path, cancel_check=None):
+    def upload(self, video_data, final_video_path, cancel_check=None, progress_cb=None):
         """
         Uploads the given video to Bilibili using `biliup` CLI.
         Assumes `biliup` is installed and `cookies.json` is in the working directory.
@@ -109,12 +109,24 @@ class BilibiliUploader:
             # Read stdout in a separate thread so the main loop can poll cancel_check instantly
             import threading
             import time
+            import re
             def log_reader(pipe):
                 try:
                     for line in pipe:
                         line = line.strip()
                         if line:
                             logging.info(f"[biliup] {line}")
+                            
+                            # Extract percentage if present (e.g. "55.5%" or "55%")
+                            if progress_cb:
+                                match = re.search(r'(\d+(?:\.\d+)?)%', line)
+                                if match:
+                                    try:
+                                        pct = int(float(match.group(1)))
+                                        if pct > 99: pct = 99
+                                        progress_cb(pct)
+                                    except:
+                                        pass
                 except Exception:
                     pass
             

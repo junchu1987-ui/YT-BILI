@@ -22,16 +22,27 @@ class VideoProcessor:
         except:
             return False
 
-    def _run_proc(self, cmd, cancel_check=None):
+    def _run_proc(self, cmd, cancel_check=None, progress_cb=None, total_duration_us=None):
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, errors='replace')
         import time
-        # Read line by line non-blocking to keep buffer clear
+        import re
         import threading
         
         output = []
         def read_output():
             for line in proc.stdout:
-                output.append(line)
+                line = line.strip()
+                if not line: continue
+                output.append(line + "\n")
+                
+                # Parse progress: out_time_us=XXXXXXX
+                if progress_cb and total_duration_us:
+                    match = re.search(r'out_time_us=(\d+)', line)
+                    if match:
+                        current_us = int(match.group(1))
+                        pct = int((current_us / total_duration_us) * 100)
+                        if pct > 99: pct = 99 # Cap at 99 until finished
+                        progress_cb(pct)
         
         t = threading.Thread(target=read_output, daemon=True)
         t.start()
@@ -54,10 +65,14 @@ class VideoProcessor:
             raise subprocess.CalledProcessError(proc.returncode, cmd, output="".join(output).encode('utf-8'))
         return True
 
-    def _run_ffmpeg_with_fallback(self, cmd_nvenc, cmd_cpu, cancel_check=None):
+    def _run_ffmpeg_with_fallback(self, cmd_nvenc, cmd_cpu, cancel_check=None, progress_cb=None, duration_us=None):
+        def inject_progress_flags(cmd):
+            # Insert -progress and -nostats just before the output path (last arg)
+            return cmd[:-1] + ['-progress', 'pipe:1', '-nostats'] + [cmd[-1]]
+
         if self.has_nvenc:
             try:
-                self._run_proc(cmd_nvenc, cancel_check)
+                self._run_proc(inject_progress_flags(cmd_nvenc), cancel_check, progress_cb, duration_us)
                 return True
             except Exception as e:
                 if "cancelled" in str(e).lower():
@@ -65,7 +80,7 @@ class VideoProcessor:
                 err = str(e)
                 logging.warning(f"NVENC encoding failed (driver issue?), falling back to CPU. Error snippet: {err[-200:]}")
         try:
-            self._run_proc(cmd_cpu, cancel_check)
+            self._run_proc(inject_progress_flags(cmd_cpu), cancel_check, progress_cb, duration_us)
             return True
         except Exception as e:
             if "cancelled" in str(e).lower():
@@ -79,8 +94,7 @@ class VideoProcessor:
         cmd = [
             ffprobe_path,
             '-v', 'error',
-            '-select_streams', 'v:0',
-            '-show_entries', 'stream=width,height,r_frame_rate,codec_name',
+            '-show_entries', 'stream=width,height,r_frame_rate,codec_name:format=duration',
             '-of', 'json',
             filepath
         ]
@@ -93,12 +107,14 @@ class VideoProcessor:
             width = stream.get('width')
             height = stream.get('height')
             fps_raw = stream.get('r_frame_rate', '30/1')
+            duration = float(info.get('format', {}).get('duration', 0))
             
             return {
                 'width': width,
                 'height': height,
                 'fps': fps_raw,
-                'vcodec': stream.get('codec_name', 'h264')
+                'vcodec': stream.get('codec_name', 'h264'),
+                'duration_us': int(duration * 1000000)
             }
         except Exception as e:
             logging.error(f"Failed to probe video {filepath}: {e}")
@@ -145,7 +161,7 @@ class VideoProcessor:
         else:
             return None
 
-    def process(self, video_data, cancel_check=None):
+    def process(self, video_data, cancel_check=None, progress_cb=None):
         """
         Transcodes intro and merges it with the downloaded video.
         """
@@ -207,7 +223,7 @@ class VideoProcessor:
                     standardized_main
                 ]
                 
-                if not self._run_ffmpeg_with_fallback(cmd_nvenc, cmd_cpu, cancel_check):
+                if not self._run_ffmpeg_with_fallback(cmd_nvenc, cmd_cpu, cancel_check, progress_cb, main_info.get('duration_us')):
                     return None
 
             list_file_path = os.path.join(video_dir, 'concat_list.txt')
@@ -227,7 +243,7 @@ class VideoProcessor:
                 final_output
             ]
             try:
-                self._run_proc(cmd_concat, cancel_check)
+                self._run_proc(cmd_concat, cancel_check) # Concat is almost instant usually
                 logging.info(f"Final video generated: {final_output}")
                 return final_output
             except Exception as e:
