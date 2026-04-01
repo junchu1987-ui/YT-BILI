@@ -3,3 +3,5 @@ yt-dlp-ejs
 biliup
 PyYAML
 flask
+Pillow
+requests

@@ -11,6 +11,7 @@ const S = {
   errors: [],
   progress: {},
   current_video: null,
+  selectedFormats: {}, // videoID -> Set of formatIDs
 };
 let selectedIds = new Set();   // for download step checkbox selection
 
@@ -288,11 +289,18 @@ function renderVideoSection() {
 
     let statusBadge = '';
     if (isUploaded) statusBadge = `<span class="badge badge-done">已上传</span>`;
-    else if (errEntry) statusBadge = `
-      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
-        <span class="badge badge-fail">${errEntry.step} 失败</span>
-        <button class="btn-retry" onclick="doRetry('${c.id}')">重试</button>
-      </div>`;
+    else if (errEntry) {
+        const stepLabel = {
+            'download': '下载',
+            'transcode': '转码',
+            'upload': '上传'
+        }[errEntry.step] || '阶段';
+        statusBadge = `
+          <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+            <span class="badge badge-fail">${errEntry.step} 失败</span>
+            <button class="btn-retry" onclick="doRetry('${c.id}')">重试${stepLabel}</button>
+          </div>`;
+    }
     else if (isTranscoded) statusBadge = `<span class="badge badge-done">转码✓</span>`;
     else if (isDownloaded) statusBadge = `<span class="badge badge-done">下载✓</span>`;
     else if (isSkip) statusBadge = `<span class="badge badge-skip">已有</span>`;
@@ -310,29 +318,94 @@ function renderVideoSection() {
       
     // Quality & Filesize
     let metaExtra = '';
-    if (c.filesize) metaExtra += `<span class="video-filesize">${(c.filesize/1024/1024).toFixed(1)} MB</span>`;
+    
     if (showCheckbox && !isSkip) {
-        // ALWAYS show selector so the user can verify quality before downloading.
-        // If 4K size data exists, use it, otherwise fallback to default.
-        const s1080 = c.size_1080p || c.filesize || 0;
-        const s4k = c.size_4k || s1080;
+        const s1080 = c.size_1080p || 0;
+        const s4k = c.size_4k || 0;
+        
+        const label1080 = s1080 ? `1080p (~${(s1080/1024/1024).toFixed(0)}MB)` : '1080p';
+        const label4k = s4k ? `4K (~${(s4k/1024/1024).toFixed(0)}MB)` : '4K / HighRes';
+        
+        let opt4k = c.has_4k ? `<option value="4k" ${c.quality==='4k'?'selected':''}>${label4k}</option>` : '';
+
         metaExtra += `<select class="quality-selector" data-id="${c.id}" data-s1080="${s1080}" data-s4k="${s4k}">
-            <option value="1080p" ${c.quality!=='4k'?'selected':''}>1080p</option>
-            <option value="4k" ${c.quality==='4k'?'selected':''}>4K/HighRes</option>
+            <option value="1080p" ${c.quality!=='4k'?'selected':''}>${label1080}</option>
+            ${opt4k}
         </select>`;
+    } else if (c.filesize) {
+        // Show actual downloaded size if processing
+        metaExtra += `<span class="video-filesize">${(c.filesize/1024/1024).toFixed(1)} MB</span>`;
     }
 
     const row = document.createElement('div');
-    row.className = 'video-item' + (isSkip ? ' skipped' : '') + (errEntry ? ' error' : '') + (isUploaded ? ' done' : '');
-    row.id = 'vi-' + c.id;
-    row.innerHTML = `
+    row.className = 'video-item-container';
+    row.id = 'vic-' + c.id;
+    
+    // Video Item Row
+    const itemRow = document.createElement('div');
+    itemRow.className = 'video-item' + (isSkip ? ' skipped' : '') + (errEntry ? ' error' : '') + (isUploaded ? ' done' : '');
+    itemRow.id = 'vi-' + c.id;
+    
+    itemRow.innerHTML = `
       ${chk}
       <div class="video-info">
         <div class="video-title" title="${escHtml(c.title)}">${escHtml(c.title)}</div>
-        <div class="video-meta">${c.id} · ${labelType(c.url_type)} ${metaExtra}</div>
+        <div class="video-meta">${c.id} · ${labelType(c.url_type)}</div>
       </div>
       ${progHtml}
       ${statusBadge}`;
+    
+    row.appendChild(itemRow);
+
+    // Formats List (only for scan_done and not skipped)
+    if (showCheckbox && !isSkip && c.formats && c.formats.length) {
+        const formatsWrap = document.createElement('div');
+        formatsWrap.className = 'video-formats';
+        
+        c.formats.forEach(f => {
+            if (f.is_thumbnail) return; // Skip thumbnails in the UI
+            const isSelected = (S.selectedFormats[c.id] || new Set()).has(f.format_id);
+            const fmtItem = document.createElement('div');
+            fmtItem.className = 'format-item' + (isSelected ? ' selected' : '');
+            fmtItem.dataset.vid = c.id;
+            fmtItem.dataset.fid = f.format_id;
+            
+            const isCombo = f.vcodec !== 'none' && f.acodec !== 'none';
+            const isAudio = f.vcodec === 'none' && f.acodec !== 'none';
+            const isVideo = f.acodec === 'none' && f.vcodec !== 'none';
+            
+            fmtItem.innerHTML = `
+                <div class="format-check"></div>
+                <div class="format-id">${f.format_id}</div>
+                <div class="format-res">${f.resolution} <span style="opacity:0.6">${f.ext}</span></div>
+                <div class="format-size">${f.filesize ? (f.filesize/1024/1024).toFixed(1)+'M' : ''}</div>
+                <div class="format-tags">
+                    ${isCombo ? '<span class="tag">Combo</span>' : ''}
+                    ${isVideo ? '<span class="tag video">Video</span>' : ''}
+                    ${isAudio ? '<span class="tag audio">Audio</span>' : ''}
+                </div>
+            `;
+            
+            fmtItem.addEventListener('click', () => {
+                if (!S.selectedFormats[c.id]) S.selectedFormats[c.id] = new Set();
+                const set = S.selectedFormats[c.id];
+                if (set.has(f.format_id)) set.delete(f.format_id);
+                else set.add(f.format_id);
+                
+                fmtItem.classList.toggle('selected');
+                // Ensure parent checkbox is checked if any format is selected
+                if (set.size > 0) {
+                    selectedIds.add(c.id);
+                    const pChk = itemRow.querySelector('.video-check');
+                    if (pChk) pChk.checked = true;
+                }
+            });
+            
+            formatsWrap.appendChild(fmtItem);
+        });
+        row.appendChild(formatsWrap);
+    }
+    
     listEl.appendChild(row);
   });
 
@@ -349,13 +422,16 @@ function renderVideoSection() {
         else selectedIds.delete(chk.dataset.id);
       });
     });
-    document.getElementById('chk-select-all').addEventListener('change', function() {
-      listEl.querySelectorAll('.video-check').forEach(chk => {
-        chk.checked = this.checked;
-        if (this.checked) selectedIds.add(chk.dataset.id);
-        else selectedIds.delete(chk.dataset.id);
-      });
-    });
+    const chkAll = document.getElementById('chk-select-all');
+    if (chkAll) {
+        chkAll.addEventListener('change', function() {
+          listEl.querySelectorAll('.video-check').forEach(chk => {
+            chk.checked = this.checked;
+            if (this.checked) selectedIds.add(chk.dataset.id);
+            else selectedIds.delete(chk.dataset.id);
+          });
+        });
+    }
   }
 }
 
@@ -374,8 +450,14 @@ async function doDownload() {
   if (!ids.length) { alert('请至少选择一个视频'); return; }
   
   const payload = ids.map(id => {
-    const sel = document.querySelector(`.quality-selector[data-id="${id}"]`);
-    return { id: id, quality: sel ? sel.value : '1080p' };
+    const selFormats = S.selectedFormats[id];
+    let format_id = null;
+    if (selFormats && selFormats.size > 0) {
+        // If user picked specific formats, join them with + (yt-dlp syntax)
+        format_id = [...selFormats].join('+');
+    }
+    
+    return { id: id, format_id: format_id, quality: 'custom' };
   });
   
   await api('POST', '/api/download', { video_ids: payload });
@@ -498,12 +580,14 @@ document.getElementById('btn-save-config').addEventListener('click', async () =>
     proxy:      document.getElementById('cfg-proxy').value.trim(),
     tid:        parseInt(document.getElementById('cfg-tid').value) || 171,
     intro_path: document.getElementById('cfg-intro').value.trim(),
-    desc_prefix: document.getElementById('cfg-desc').value.trim(),
+    desc_prefix:document.getElementById('cfg-desc').value,
   };
-  await api('POST', '/api/config', cfg);
-  const ok = document.getElementById('save-config-ok');
-  ok.style.display = 'inline';
-  setTimeout(() => ok.style.display = 'none', 2000);
+  const res = await api('POST', '/api/config', cfg);
+  if (res && res.ok) {
+    const ok = document.getElementById('save-ok');
+    ok.style.display = '';
+    setTimeout(() => { ok.style.display = 'none'; }, 2500);
+  }
 });
 
 // ── Bilibili status (sidebar) ─────────────────────────────────────────────────

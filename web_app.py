@@ -8,6 +8,14 @@ import time
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, Response, send_from_directory
 from bili_uploader import BilibiliUploader
+import re
+
+# Helper for filename-safe titles
+def slugify(text):
+    # Remove Windows illegal characters: \/:*?"<>|
+    text = re.sub(r'[\\/:*?"<>|]', '_', text)
+    # Remove trailing dots/spaces and limit length
+    return text.strip().rstrip('. ')[:100]
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 os.makedirs('logs', exist_ok=True)
@@ -126,29 +134,48 @@ def run_scan():
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': True,
+                'extract_flat': False, # Fetch full info for filesize data
                 'proxy': cfg['app'].get('proxy')
             }
             with YoutubeDL(ydl_opts) as ydl:
                 try:
                     info = ydl.extract_info(url, download=False)
-                    if 'entries' in info: # Playlist/Channel
-                        for e in info['entries']:
-                            if not e: continue
-                            new_candidates.append({
-                                'id': e['id'],
-                                'title': e['title'],
-                                'url': f"https://www.youtube.com/watch?v={e['id']}",
-                                'url_type': 'video',
-                                'already_downloaded': False # Logic to check history
+                    entries = info.get('entries', [info])
+                    
+                    for e in entries:
+                        if not e: continue
+                        
+                        all_formats = []
+                        for f in e.get('formats', []):
+                            # Filter out storyboards/fragments but keep a record of thumbnails if needed
+                            if f.get('acodec') == 'none' and f.get('vcodec') == 'none': continue
+                            
+                            is_thumb = f.get('ext') in ['webp', 'jpg', 'jpeg', 'png']
+                            
+                            all_formats.append({
+                                'format_id': f.get('format_id'),
+                                'ext': f.get('ext'),
+                                'resolution': f.get('resolution') or (f"{f.get('width')}x{f.get('height')}" if f.get('width') else 'audio only'),
+                                'filesize': f.get('filesize') or f.get('filesize_approx') or 0,
+                                'vcodec': f.get('vcodec', 'none'),
+                                'acodec': f.get('acodec', 'none'),
+                                'abr': f.get('abr', 0),
+                                'vbr': f.get('vbr', 0),
+                                'note': f.get('format_note', ''),
+                                'is_thumbnail': is_thumb
                             })
-                    else: # Single video
+
+                        # Sort formats: combined first, then resolution desc
+                        all_formats.sort(key=lambda x: (x['vcodec'] != 'none' and x['acodec'] != 'none', x['resolution']), reverse=True)
+
                         new_candidates.append({
-                            'id': info['id'],
-                            'title': info['title'],
-                            'url': url,
+                            'id': e['id'],
+                            'title': e['title'],
+                            'description': e.get('description', ''),
+                            'url': f"https://www.youtube.com/watch?v={e['id']}" if 'entries' in info else url,
                             'url_type': 'video',
-                            'already_downloaded': False
+                            'already_downloaded': False,
+                            'formats': all_formats
                         })
                 except Exception as e:
                     log_to_web('error', f"源解析失败 {url}: {str(e)}")
@@ -178,25 +205,38 @@ def run_download(video_ids):
         for vid_entry in video_ids:
             if S['cancel_flag']: break
             vid = vid_entry['id']
+            # Accept explicit format_id from frontend selection
+            format_id = vid_entry.get('format_id')
             quality = vid_entry.get('quality', '1080p')
             
             c = next((x for x in S['candidates'] if x['id'] == vid), None)
             if not c: continue
             
-            log_to_web('info', f"开始下载 [{quality}]: {c['title']}", vid)
+            log_to_web('info', f"开始下载 [{format_id or quality}]: {c['title']}", vid)
             
-            out_tmpl = os.path.join(work_dir, vid, f"{vid}.%(ext)s")
+            # Phase 1: Slugified Path Naming
+            safe_title = slugify(c['title'])
+            vid_dir = os.path.join(work_dir, safe_title)
+            os.makedirs(vid_dir, exist_ok=True)
+            out_tmpl = os.path.join(vid_dir, f"{safe_title}.%(ext)s")
             
-            # Format selection based on user choice
-            if quality == '4k':
-                format_sel = 'bestvideo+bestaudio/best'
+            # Phase 2: Format selection
+            if format_id:
+                format_sel = format_id
+            elif quality == '4k':
+                format_sel = 'bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
             else:
-                format_sel = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+                format_sel = 'bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]'
 
             def ydl_hook(d):
+                if S['cancel_flag']:
+                    raise Exception("Download cancelled by user")
                 if d['status'] == 'downloading':
-                    p = d.get('_percent_str', '0%').replace('%','')
-                    try: pct = float(p)
+                    p = d.get('_percent_str', '0%').replace('%','').strip()
+                    try: 
+                        import re
+                        p = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', p)
+                        pct = float(p)
                     except: pct = 0
                     report_progress(vid, pct, f"下载中... {d.get('_speed_str','')}")
                 elif d['status'] == 'finished':
@@ -210,21 +250,48 @@ def run_download(video_ids):
                 'quiet': True,
                 'no_warnings': True,
                 'merge_output_format': 'mp4',
+                'writethumbnail': True,
+                'ffmpeg_location': cfg['ffmpeg'].get('bin_path')
             }
 
             try:
                 with YoutubeDL(ydl_opts) as ydl:
                     ydl.download([c['url']])
                 
-                # Verify file exists
-                vid_dir = os.path.join(work_dir, vid)
-                mp4_file = os.path.join(vid_dir, f"{vid}.mp4")
-                if os.path.exists(mp4_file):
+                # Phase 3: Flexible Verify and Map
+                # Instead of a fixed filename, scan the directory for the largest MP4/MKV/Video file
+                found_video = None
+                max_size = 0
+                
+                if os.path.exists(vid_dir):
+                    for f in os.listdir(vid_dir):
+                        if f.endswith(('.mp4', '.mkv', '.mov', '.ts', '.flv')):
+                            fpath = os.path.join(vid_dir, f)
+                            fsize = os.path.getsize(fpath)
+                            if fsize > max_size and fsize > 10 * 1024 * 1024: # Must be > 10MB to be a video
+                                max_size = fsize
+                                found_video = fpath
+
+                if found_video:
+                    # Store the local path for downstream steps
+                    c['local_path'] = found_video
+                    c['local_dir'] = vid_dir
+                    
+                    # Check for thumbnail (might be .jpg, .png, .webp)
+                    # Look for any image file in the directory
+                    for f in os.listdir(vid_dir):
+                        if f.lower().endswith(('.jpg', '.png', '.webp', '.jpeg')):
+                            c['original_thumbnail'] = os.path.join(vid_dir, f)
+                            break
+                    
                     S['downloaded'].append(c)
-                    log_to_web('info', f"成功下载: {c['title']}", vid)
+                    log_to_web('info', f"成功下载并识别: {os.path.basename(found_video)}", vid)
                 else:
-                    raise Exception("下载文件未找到(合并失败?)")
+                    raise Exception("下载完成但未找到有效的视频文件(>10MB)")
+                    
             except Exception as e:
+                # Log error but DO NOT DELETE the directory
+                log_to_web('error', f"下载阶段异常: {str(e)}", vid)
                 S['errors'].append({'id': vid, 'step': 'download', 'message': str(e)})
                 log_to_web('error', f"下载失败: {str(e)}", vid)
 
@@ -237,70 +304,34 @@ def run_transcode():
     try:
         update_state('transcoding')
         cfg = load_config()
-        work_dir = cfg['app']['work_dir']
-        intro_path = cfg['ffmpeg'].get('intro_video_path')
-        ffmpeg_bin = cfg['ffmpeg'].get('bin_path', 'ffmpeg')
-
-        import subprocess
+        from video_processor import VideoProcessor
+        processor = VideoProcessor(cfg)
 
         for c in S['downloaded']:
             if S['cancel_flag']: break
             vid = c['id']
             log_to_web('info', f"启动转码流程: {c['title']}", vid)
             
-            vid_dir = os.path.join(work_dir, vid)
-            src_file = os.path.join(vid_dir, f"{vid}.mp4")
-            dst_file = os.path.join(vid_dir, f"{vid}_final.mp4")
+            # Use Slugified Paths
+            safe_title = slugify(c['title'])
+            video_data = {
+                'id': vid,
+                'filepath': os.path.join(cfg['app']['work_dir'], safe_title, f"{safe_title}.mp4")
+            }
 
-            # Check if intro exists
-            has_intro = intro_path and os.path.exists(intro_path)
-            
-            # Simple FFmpeg command: Standardization to H264/AAC at 30fps
-            # In a real app involving concatenations, we might need more complex filters
-            cmd = []
-            if has_intro:
-                # Advanced concat filter
-                cmd = [
-                    ffmpeg_bin, '-y',
-                    '-i', intro_path,
-                    '-i', src_file,
-                    '-filter_complex',
-                    "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];"
-                    "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];"
-                    "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a0];"
-                    "[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];"
-                    "[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]",
-                    '-map', '[outv]', '-map', '[outa]',
-                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-                    '-c:a', 'aac', '-b:a', '128k',
-                    dst_file
-                ]
-            else:
-                # Just standardization
-                cmd = [
-                    ffmpeg_bin, '-y',
-                    '-i', src_file,
-                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
-                    '-c:a', 'aac', '-b:a', '128k',
-                    '-vf', "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
-                    dst_file
-                ]
+            def transcode_progress(pct):
+                report_progress(vid, pct, "转码中 (视频流处理)...")
 
             try:
-                # We use Popen to track progress if needed, but here we just wait
-                log_to_web('info', f"执行 FFmpeg: {' '.join(cmd[:10])}...", vid)
-                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+                def check_cancel(): return S['cancel_flag']
+                res = processor.process(video_data, cancel_check=check_cancel, progress_cb=transcode_progress)
                 
-                # Mock progress since reading FFmpeg stderr is complex
-                report_progress(vid, 30, "转码中 (视频流处理)...")
-                proc.wait()
-                
-                if proc.returncode == 0:
+                if res:
                     S['transcoded'].append(c)
                     report_progress(vid, 100, "转码完成")
                     log_to_web('info', f"转码成功: {c['title']}", vid)
                 else:
-                    raise Exception(f"FFmpeg 返回非零状态 {proc.returncode}")
+                    raise Exception("计算后端返回失败")
             except Exception as e:
                 S['errors'].append({'id': vid, 'step': 'transcode', 'message': str(e)})
                 log_to_web('error', f"转码失败: {str(e)}", vid)
@@ -323,14 +354,31 @@ def run_upload():
             vid = c['id']
             log_to_web('info', f"准备上传至 B站: {c['title']}", vid)
             
-            file_path = os.path.join(work_dir, vid, f"{vid}_final.mp4")
+            # Use Slugified Paths
+            safe_title = slugify(c['title'])
+            vid_dir = os.path.join(work_dir, safe_title)
+            file_path = os.path.join(vid_dir, f"{safe_title}_final.mp4")
             
-            # Use uploader instance
+            # Check for original thumbnail (downloaded by yt-dlp)
+            thumb_path = None
+            for ext in ['jpg', 'png', 'webp', 'jpeg']:
+                test_thumb = os.path.join(vid_dir, f"{safe_title}.{ext}")
+                if os.path.exists(test_thumb):
+                    thumb_path = test_thumb
+                    break
+
             def upload_progress(pct, msg):
                 report_progress(vid, pct, msg)
 
             try:
-                res = uploader.upload(file_path, c['title'], c['url'], progress_callback=upload_progress)
+                res = uploader.upload(
+                    file_path, 
+                    c['title'], 
+                    c['url'], 
+                    original_thumbnail=thumb_path, 
+                    original_description=c.get('description', ''),
+                    progress_callback=upload_progress
+                )
                 if res:
                     S['uploaded'].append(c)
                     add_history(vid)
@@ -343,7 +391,7 @@ def run_upload():
 
         update_state('done')
     except Exception as e:
-        log_to_web('error', f"上传阶段崩溃: {str(web_app_error)}") # corrected variable name
+        log_to_web('error', f"上传阶段崩溃: {str(e)}")
         update_state('transcode_done')
 
 # ── History Persistence ──────────────────────────────────────────────────────
@@ -417,6 +465,84 @@ def trigger_reset():
 def trigger_cancel():
     S['cancel_flag'] = True
     log_to_web('warn', "任务取消请求已发出...")
+    return jsonify({'ok': True})
+
+@app.route('/api/retry', methods=['POST'])
+def trigger_retry():
+    data = request.json or {}
+    vid = data.get('video_id')
+    if not vid: return jsonify({'error': 'Missing video_id'}), 400
+    
+    # Identify the failed step
+    err_entry = next((e for e in S['errors'] if e['id'] == vid), None)
+    failed_step = err_entry['step'] if err_entry else 'unknown'
+    
+    # Remove from errors
+    S['errors'] = [e for e in S['errors'] if e['id'] != vid]
+    
+    video_entry = next((c for c in S['candidates'] if c['id'] == vid), None)
+    if not video_entry:
+        video_entry = next((c for x in [S['downloaded'], S['transcoded'], S['uploaded']] for c in x if c['id'] == vid), None)
+    
+    if not video_entry:
+        return jsonify({'error': 'Video not found'}), 404
+        
+    log_to_web('info', f"重试任务 ({failed_step}): {video_entry['title']}", vid)
+    
+    def retry_worker():
+        try:
+            cfg = load_config()
+            # 1. Retry DOWNLOAD
+            if failed_step == 'download':
+                run_download([{'id': vid, 'quality': video_entry.get('quality', '1080p')}])
+            
+            # 2. Retry TRANSCODE
+            elif failed_step == 'transcode':
+                from video_processor import VideoProcessor
+                processor = VideoProcessor(cfg)
+                safe_title = slugify(video_entry['title'])
+                src_path = os.path.join(cfg['app']['work_dir'], safe_title, f"{safe_title}.mp4")
+                v_data = {'id': vid, 'filepath': src_path}
+                def pb(p): report_progress(vid, p, "重试转码中...")
+                if processor.process(v_data, cancel_check=lambda: S['cancel_flag'], progress_cb=pb):
+                    if video_entry not in S['transcoded']: S['transcoded'].append(video_entry)
+                    report_progress(vid, 100, "转码完成")
+                    # If all now transcoded, allow manual or auto transition
+                    if not S['errors']: update_state('transcode_done')
+                else: raise Exception("转码逻辑失败")
+
+            # 3. Retry UPLOAD
+            elif failed_step in ['upload', 'transcode_retry']:
+                from bili_uploader import BilibiliUploader
+                uploader = BilibiliUploader(cfg)
+                safe_title = slugify(video_entry['title'])
+                vid_dir = os.path.join(cfg['app']['work_dir'], safe_title)
+                final_mp4 = os.path.join(vid_dir, f"{safe_title}_final.mp4")
+                
+                # Check for thumbnail
+                thumb = None
+                for ext in ['jpg', 'png', 'webp', 'jpeg']:
+                    tf = os.path.join(vid_dir, f"{safe_title}.{ext}")
+                    if os.path.exists(tf): thumb = tf; break
+
+                def up_pb(p, s): report_progress(vid, p, s)
+                if uploader.upload(final_mp4, video_entry['title'], video_entry['url'], 
+                                   original_thumbnail=thumb, 
+                                   original_description=video_entry.get('description', ''),
+                                   progress_callback=up_pb):
+                    if video_entry not in S['uploaded']: S['uploaded'].append(video_entry)
+                    report_progress(vid, 100, "上传完成")
+                    add_history(vid)
+                    # Complete batch if no more errors
+                    if not S['errors']: update_state('done')
+                else: raise Exception("再次投递失败")
+            else:
+                log_to_web('warn', f"未知的失败状态 '{failed_step}'，无法自动重试", vid)
+        except Exception as e:
+            S['errors'].append({'id': vid, 'step': f"{failed_step}_retry", 'message': str(e)})
+            log_to_web('error', f"重试失败: {str(e)}", vid)
+            
+    threading.Thread(target=retry_worker, daemon=True).start()
     return jsonify({'ok': True})
 
 # ── Config API ───────────────────────────────────────────────────────────────

@@ -1,0 +1,25 @@
+app:
+  work_dir: ./data
+  proxy: ''
+  host: 127.0.0.1
+  port: 5000
+
+youtube:
+  sources:
+    - url: https://www.youtube.com/watch?v=EXAMPLE
+      title: Example Title
+      type: video
+
+ffmpeg:
+  # Path to ffmpeg.exe (e.g., C:\ffmpeg\bin\ffmpeg.exe)
+  bin_path: ffmpeg
+  intro_video_path: ./assets/1.mp4
+
+bilibili:
+  tid: 233
+  desc_prefix: '本视频搬运自YouTube。\n\n原视频链接：{youtube_url}\n\n'
+
+baidu_fanyi:
+  # Apply for credentials at https://fanyi-api.baidu.com/
+  appid: 'your_baidu_appid'
+  security_key: 'your_baidu_security_key'

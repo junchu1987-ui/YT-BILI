@@ -92,6 +92,7 @@ class YouTubeDownloader:
                 if self.bun_path and os.path.exists(self.bun_path)
                 else None
             ),
+            'ffmpeg_location': self.config['ffmpeg'].get('bin_path', 'ffmpeg'),
         }
         if self.proxy:
             opts['proxy'] = self.proxy

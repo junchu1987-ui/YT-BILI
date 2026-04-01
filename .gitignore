@@ -31,13 +31,22 @@ main_standardized.mp4
 .agents/
 pyrightconfig.json
 
-# Binaries
-bin/
-Antigravity.exe
-bun.exe
-deno.exe
-
-# Bilibili session (Keep private)
+# Bilibili session & Config (Keep private)
+config.yaml
+history.json
 cookies.json
 youtube_cookies.txt
 qrcode.png
+*.cookie
+
+# Logs & Temp
+*.log
+logs/
+ds_update.log*
+__pycache__/
+*.tmp
+concat_list.txt
+concat.txt
+intro_transcoded.mp4
+main_standardized.mp4
+intro_match_*.mp4
