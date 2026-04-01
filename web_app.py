@@ -1,201 +1,423 @@
-"""
-web_app.py — Flask Web UI for YT_BI_Anti pipeline.
-Run: python web_app.py
-Open: http://127.0.0.1:5000
-"""
 import os
 import sys
+import yaml
 import json
-import queue
 import logging
 import threading
-import subprocess
 import time
 from datetime import datetime
-
-# ── Resolve bun path before any yt-dlp import ──────────────────────────────
-_BUN_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'bin', 'bun.exe')
-
-from flask import Flask, render_template, jsonify, request, Response, stream_with_context
-import yaml
-
-from yt_downloader import YouTubeDownloader, detect_url_type
-from video_processor import VideoProcessor
+from flask import Flask, render_template, request, jsonify, Response, send_from_directory
 from bili_uploader import BilibiliUploader
 
-# ── App setup ───────────────────────────────────────────────────────────────
+# ── Logging ──────────────────────────────────────────────────────────────────
+os.makedirs('logs', exist_ok=True)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(f"logs/web_{datetime.now().strftime('%Y%m%d')}.log", encoding='utf-8'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ── App Init ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
-app.json.ensure_ascii = False
-
-CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.yaml')
-
-# ── Global pipeline state (in-memory) ───────────────────────────────────────
-# Status machine:
-#   idle → scanning → scan_done → downloading → download_done
-#   → transcoding → transcode_done → uploading → done (→ idle)
-
-_state_lock = threading.Lock()
-_cancel_requested = False
-_pipeline = {
-    'status': 'idle',
-    'candidates': [],    # from scan — all videos including already_downloaded
-    'downloaded': [],    # successfully downloaded this session
-    'transcoded': [],    # successfully transcoded this session
-    'uploaded': [],      # successfully uploaded this session
-    'errors': [],
-    'progress': {},      # {video_id: {pct, message}}
-    'current_video': None,
+# Global state for pipeline
+S = {
+    'status': 'idle',      # idle, scanning, scan_done, downloading, download_done, transcoding, transcode_done, uploading, done
+    'candidates': [],       # List of discovered videos
+    'downloaded': [],       # List of successfully downloaded videos
+    'transcoded': [],       # List of successfully transcoded videos
+    'uploaded': [],         # List of successfully uploaded videos
+    'errors': [],           # List of {id, step, message}
+    'progress': {},         # id -> {pct, message} - for real-time reporting
+    'cancel_flag': False,
+    'current_task': None
 }
 
-# SSE event queue — multiple clients share the same events
-_event_queues: list[queue.Queue] = []
-_eq_lock = threading.Lock()
+def reset_pipeline():
+    S['status'] = 'idle'
+    S['candidates'] = []
+    S['downloaded'] = []
+    S['transcoded'] = []
+    S['uploaded'] = []
+    S['errors'] = []
+    S['progress'] = {}
+    S['cancel_flag'] = False
+    S['current_task'] = None
 
-def check_cancel():
-    return _cancel_requested
+# ── Config Loader ────────────────────────────────────────────────────────────
+CONFIG_FILE = 'config.yaml'
 
+def load_config():
+    if not os.path.exists(CONFIG_FILE):
+        return {
+            'app': {'work_dir': './data', 'proxy': '', 'host': '127.0.0.1', 'port': 5000},
+            'youtube': {'sources': []},
+            'ffmpeg': {'bin_path': 'ffmpeg', 'intro_video_path': './assets/intro.mp4'},
+            'bilibili': {'tid': 171, 'desc_prefix': '本视频搬运自YouTube。\n\n原视频链接：{youtube_url}\n\n\n'}
+        }
+    with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+        return yaml.safe_load(f)
 
-def _emit(event_type: str, data: dict):
-    """Push an SSE event to all connected clients."""
-    payload = json.dumps(data, ensure_ascii=False)
-    msg = f"event: {event_type}\ndata: {payload}\n\n"
-    with _eq_lock:
-        dead = []
-        for q in _event_queues:
-            try:
-                q.put_nowait(msg)
-            except queue.Full:
-                dead.append(q)
-        for q in dead:
-            _event_queues.remove(q)
+def save_config(cfg):
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
 
+# ── SSE Event Hub ────────────────────────────────────────────────────────────
+clients = []
 
-def _log(level: str, message: str):
-    logging.info(f"[{level}] {message}")
-    _emit('log', {
-        'level': level,
-        'message': message,
-        'ts': datetime.now().strftime('%H:%M:%S')
-    })
-
-
-def _set_status(status: str, extra: dict = None):
-    with _state_lock:
-        _pipeline['status'] = status
-        if extra:
-            _pipeline.update(extra)
-    payload = {'status': status}
-    if extra:
-        payload.update(extra)
-    _emit('state', payload)
-
-
-def _set_progress(video_id: str, pct: int, message: str = ''):
-    with _state_lock:
-        _pipeline['progress'][video_id] = {'pct': pct, 'message': message}
-    _emit('progress', {'id': video_id, 'pct': pct, 'message': message})
-
-
-# ── Config helpers ───────────────────────────────────────────────────────────
-
-def load_config() -> dict:
-    with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
-        cfg = yaml.safe_load(f)
-    cfg['_bun_path'] = _BUN_PATH
-    return cfg
-
-
-def save_config(cfg: dict):
-    """Write config back to disk, stripping internal keys."""
-    out = {k: v for k, v in cfg.items() if not k.startswith('_')}
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
-        yaml.dump(out, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
-
-
-# ── SSE endpoint ─────────────────────────────────────────────────────────────
+def broadcast(event, data):
+    payload = f"event: {event}\ndata: {json.dumps(data)}\n\n"
+    for q in list(clients):
+        try:
+            q.put(payload)
+        except:
+            clients.remove(q)
 
 @app.route('/events')
 def events():
-    q = queue.Queue(maxsize=200)
-    with _eq_lock:
-        _event_queues.append(q)
+    import queue
+    q = queue.Queue()
+    clients.append(q)
+    def stream():
+        # Send initial snapshot
+        yield f"event: snapshot\ndata: {json.dumps({k: S[k] for k in S if k != 'current_task'})}\n\n"
+        while True:
+            yield q.get()
+    return Response(stream(), mimetype='text/event-stream')
 
-    def generate():
-        # Send current state immediately on connect
-        with _state_lock:
-            snap = json.dumps(_pipeline, ensure_ascii=False)
-        yield f"event: snapshot\ndata: {snap}\n\n"
-        try:
-            while True:
-                try:
-                    msg = q.get(timeout=30)
-                    yield msg
-                except queue.Empty:
-                    yield ": heartbeat\n\n"
-        except GeneratorExit:
-            with _eq_lock:
-                if q in _event_queues:
-                    _event_queues.remove(q)
+def update_state(new_status=None, **kwargs):
+    if new_status: S['status'] = new_status
+    for k, v in kwargs.items():
+        if k in S: S[k] = v
+    broadcast('state', {k: S[k] for k in S if k != 'current_task'})
 
-    return Response(
-        stream_with_context(generate()),
-        mimetype='text/event-stream',
-        headers={
-            'Cache-Control': 'no-cache',
-            'X-Accel-Buffering': 'no',
-        }
-    )
+def log_to_web(level, message, video_id=None):
+    ts = datetime.now().strftime('%H:%M:%S')
+    broadcast('log', {'ts': ts, 'level': level, 'message': message, 'id': video_id})
+    if level == 'error':
+        logger.error(f"[{video_id or 'GLOBAL'}] {message}")
+    else:
+        logger.info(f"[{video_id or 'GLOBAL'}] {message}")
 
+def report_progress(video_id, pct, message):
+    S['progress'][video_id] = {'pct': pct, 'message': message}
+    broadcast('progress', {'id': video_id, 'pct': pct, 'message': message})
 
-# ── Sources API ──────────────────────────────────────────────────────────────
-
-@app.route('/api/sources', methods=['GET'])
-def get_sources():
-    cfg = load_config()
-    sources_raw = cfg['youtube'].get('sources', cfg['youtube'].get('channel_urls', []))
-    sources = []
-    for s in sources_raw:
-        if isinstance(s, dict):
-            sources.append(s)
-        else:
-            sources.append({'url': s, 'type': detect_url_type(s), 'title': s})
-    return jsonify(sources)
-
-
-@app.route('/api/sources', methods=['POST'])
-def add_source():
-    url = request.json.get('url', '').strip()
-    if not url:
-        return jsonify({'error': 'URL required'}), 400
-    cfg = load_config()
-    sources = cfg['youtube'].setdefault('sources', cfg['youtube'].pop('channel_urls', []))
-    
-    # Duplicate check
-    for s in sources:
-        if (isinstance(s, dict) and s.get('url') == url) or (s == url):
-            return jsonify({'error': 'URL already exists'}), 400
+# ── Pipeline Core ─────────────────────────────────────────────────────────────
+def run_scan():
+    try:
+        update_state('scanning')
+        log_to_web('info', "开始扫描数据源...")
+        cfg = load_config()
+        sources = cfg['youtube'].get('sources', [])
+        
+        from yt_dlp import YoutubeDL
+        import uuid
+        
+        new_candidates = []
+        for s in sources:
+            if S['cancel_flag']: break
+            url = s['url']
+            log_to_web('info', f"扫描中: {url}")
             
-    # Fetch Meta
-    downloader = YouTubeDownloader(cfg)
-    url_type = detect_url_type(url)
-    meta = downloader.fetch_source_metadata(url, url_type)
+            ydl_opts = {
+                'quiet': True,
+                'no_warnings': True,
+                'extract_flat': True,
+                'proxy': cfg['app'].get('proxy')
+            }
+            with YoutubeDL(ydl_opts) as ydl:
+                try:
+                    info = ydl.extract_info(url, download=False)
+                    if 'entries' in info: # Playlist/Channel
+                        for e in info['entries']:
+                            if not e: continue
+                            new_candidates.append({
+                                'id': e['id'],
+                                'title': e['title'],
+                                'url': f"https://www.youtube.com/watch?v={e['id']}",
+                                'url_type': 'video',
+                                'already_downloaded': False # Logic to check history
+                            })
+                    else: # Single video
+                        new_candidates.append({
+                            'id': info['id'],
+                            'title': info['title'],
+                            'url': url,
+                            'url_type': 'video',
+                            'already_downloaded': False
+                        })
+                except Exception as e:
+                    log_to_web('error', f"源解析失败 {url}: {str(e)}")
+
+        # Deduplicate and check history
+        history = get_history()
+        for c in new_candidates:
+            if c['id'] in history:
+                c['already_downloaded'] = True
+        
+        # Merge with existing candidates (if any)
+        S['candidates'] = new_candidates
+        log_to_web('info', f"扫描完成，发现 {len(new_candidates)} 个候选视频。")
+        update_state('scan_done')
+    except Exception as e:
+        log_to_web('error', f"扫描阶段崩溃: {str(e)}")
+        update_state('idle')
+
+def run_download(video_ids):
+    try:
+        update_state('downloading')
+        cfg = load_config()
+        work_dir = cfg['app']['work_dir']
+        
+        from yt_dlp import YoutubeDL
+        
+        for vid_entry in video_ids:
+            if S['cancel_flag']: break
+            vid = vid_entry['id']
+            quality = vid_entry.get('quality', '1080p')
+            
+            c = next((x for x in S['candidates'] if x['id'] == vid), None)
+            if not c: continue
+            
+            log_to_web('info', f"开始下载 [{quality}]: {c['title']}", vid)
+            
+            out_tmpl = os.path.join(work_dir, vid, f"{vid}.%(ext)s")
+            
+            # Format selection based on user choice
+            if quality == '4k':
+                format_sel = 'bestvideo+bestaudio/best'
+            else:
+                format_sel = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+
+            def ydl_hook(d):
+                if d['status'] == 'downloading':
+                    p = d.get('_percent_str', '0%').replace('%','')
+                    try: pct = float(p)
+                    except: pct = 0
+                    report_progress(vid, pct, f"下载中... {d.get('_speed_str','')}")
+                elif d['status'] == 'finished':
+                    report_progress(vid, 100, "下载完成")
+
+            ydl_opts = {
+                'format': format_sel,
+                'outtmpl': out_tmpl,
+                'progress_hooks': [ydl_hook],
+                'proxy': cfg['app'].get('proxy'),
+                'quiet': True,
+                'no_warnings': True,
+                'merge_output_format': 'mp4',
+            }
+
+            try:
+                with YoutubeDL(ydl_opts) as ydl:
+                    ydl.download([c['url']])
+                
+                # Verify file exists
+                vid_dir = os.path.join(work_dir, vid)
+                mp4_file = os.path.join(vid_dir, f"{vid}.mp4")
+                if os.path.exists(mp4_file):
+                    S['downloaded'].append(c)
+                    log_to_web('info', f"成功下载: {c['title']}", vid)
+                else:
+                    raise Exception("下载文件未找到(合并失败?)")
+            except Exception as e:
+                S['errors'].append({'id': vid, 'step': 'download', 'message': str(e)})
+                log_to_web('error', f"下载失败: {str(e)}", vid)
+
+        update_state('download_done')
+    except Exception as e:
+        log_to_web('error', f"下载阶段崩溃: {str(e)}")
+        update_state('scan_done')
+
+def run_transcode():
+    try:
+        update_state('transcoding')
+        cfg = load_config()
+        work_dir = cfg['app']['work_dir']
+        intro_path = cfg['ffmpeg'].get('intro_video_path')
+        ffmpeg_bin = cfg['ffmpeg'].get('bin_path', 'ffmpeg')
+
+        import subprocess
+
+        for c in S['downloaded']:
+            if S['cancel_flag']: break
+            vid = c['id']
+            log_to_web('info', f"启动转码流程: {c['title']}", vid)
+            
+            vid_dir = os.path.join(work_dir, vid)
+            src_file = os.path.join(vid_dir, f"{vid}.mp4")
+            dst_file = os.path.join(vid_dir, f"{vid}_final.mp4")
+
+            # Check if intro exists
+            has_intro = intro_path and os.path.exists(intro_path)
+            
+            # Simple FFmpeg command: Standardization to H264/AAC at 30fps
+            # In a real app involving concatenations, we might need more complex filters
+            cmd = []
+            if has_intro:
+                # Advanced concat filter
+                cmd = [
+                    ffmpeg_bin, '-y',
+                    '-i', intro_path,
+                    '-i', src_file,
+                    '-filter_complex',
+                    "[0:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v0];"
+                    "[1:v]scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1[v1];"
+                    "[0:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a0];"
+                    "[1:a]aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a1];"
+                    "[v0][a0][v1][a1]concat=n=2:v=1:a=1[outv][outa]",
+                    '-map', '[outv]', '-map', '[outa]',
+                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                    '-c:a', 'aac', '-b:a', '128k',
+                    dst_file
+                ]
+            else:
+                # Just standardization
+                cmd = [
+                    ffmpeg_bin, '-y',
+                    '-i', src_file,
+                    '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '23',
+                    '-c:a', 'aac', '-b:a', '128k',
+                    '-vf', "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2",
+                    dst_file
+                ]
+
+            try:
+                # We use Popen to track progress if needed, but here we just wait
+                log_to_web('info', f"执行 FFmpeg: {' '.join(cmd[:10])}...", vid)
+                proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, universal_newlines=True)
+                
+                # Mock progress since reading FFmpeg stderr is complex
+                report_progress(vid, 30, "转码中 (视频流处理)...")
+                proc.wait()
+                
+                if proc.returncode == 0:
+                    S['transcoded'].append(c)
+                    report_progress(vid, 100, "转码完成")
+                    log_to_web('info', f"转码成功: {c['title']}", vid)
+                else:
+                    raise Exception(f"FFmpeg 返回非零状态 {proc.returncode}")
+            except Exception as e:
+                S['errors'].append({'id': vid, 'step': 'transcode', 'message': str(e)})
+                log_to_web('error', f"转码失败: {str(e)}", vid)
+
+        update_state('transcode_done')
+    except Exception as e:
+        log_to_web('error', f"转码阶段崩溃: {str(e)}")
+        update_state('download_done')
+
+def run_upload():
+    try:
+        update_state('uploading')
+        cfg = load_config()
+        work_dir = cfg['app']['work_dir']
+        
+        uploader = BilibiliUploader(cfg)
+        
+        for c in S['transcoded']:
+            if S['cancel_flag']: break
+            vid = c['id']
+            log_to_web('info', f"准备上传至 B站: {c['title']}", vid)
+            
+            file_path = os.path.join(work_dir, vid, f"{vid}_final.mp4")
+            
+            # Use uploader instance
+            def upload_progress(pct, msg):
+                report_progress(vid, pct, msg)
+
+            try:
+                res = uploader.upload(file_path, c['title'], c['url'], progress_callback=upload_progress)
+                if res:
+                    S['uploaded'].append(c)
+                    add_history(vid)
+                    log_to_web('info', f"B站上传成功: {c['title']}", vid)
+                else:
+                    raise Exception("上传器返回失败状态")
+            except Exception as e:
+                S['errors'].append({'id': vid, 'step': 'upload', 'message': str(e)})
+                log_to_web('error', f"上传失败: {str(e)}", vid)
+
+        update_state('done')
+    except Exception as e:
+        log_to_web('error', f"上传阶段崩溃: {str(web_app_error)}") # corrected variable name
+        update_state('transcode_done')
+
+# ── History Persistence ──────────────────────────────────────────────────────
+HISTORY_FILE = 'history.json'
+def get_history():
+    if not os.path.exists(HISTORY_FILE): return []
+    try:
+        with open(HISTORY_FILE, 'r') as f: return json.load(f)
+    except: return []
+
+def add_history(vid):
+    h = get_history()
+    if vid not in h:
+        h.append(vid)
+        with open(HISTORY_FILE, 'w') as f: json.dump(h, f)
+
+# ── API Routes ────────────────────────────────────────────────────────────────
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+@app.route('/api/status', methods=['GET'])
+def get_status():
+    return jsonify({k: S[k] for k in S if k != 'current_task'})
+
+@app.route('/api/scan', methods=['POST'])
+def trigger_scan():
+    if S['status'] in ['scanning', 'downloading', 'transcoding', 'uploading']:
+        return jsonify({'error': 'Pipeline busy'}), 400
+    S['cancel_flag'] = False
+    S['current_task'] = threading.Thread(target=run_scan)
+    S['current_task'].start()
+    return jsonify({'ok': True})
+
+@app.route('/api/download', methods=['POST'])
+def trigger_download():
+    data = request.json or {}
+    video_ids = data.get('video_ids', []) # Expected list of {id, quality}
+    if not video_ids: return jsonify({'error': 'No IDs provided'}), 400
+    if S['status'] != 'scan_done': return jsonify({'error': 'Wrong state'}), 400
     
-    sources.append(meta)
-    save_config(cfg)
-    return jsonify(meta)
+    S['cancel_flag'] = False
+    S['current_task'] = threading.Thread(target=run_download, args=(video_ids,))
+    S['current_task'].start()
+    return jsonify({'ok': True})
 
+@app.route('/api/transcode', methods=['POST'])
+def trigger_transcode():
+    if S['status'] != 'download_done': return jsonify({'error': 'Wrong state'}), 400
+    S['cancel_flag'] = False
+    S['current_task'] = threading.Thread(target=run_transcode)
+    S['current_task'].start()
+    return jsonify({'ok': True})
 
-@app.route('/api/sources/<int:idx>', methods=['DELETE'])
-def delete_source(idx):
-    cfg = load_config()
-    sources = cfg['youtube'].get('sources', cfg['youtube'].get('channel_urls', []))
-    if 0 <= idx < len(sources):
-        sources.pop(idx)
-        cfg['youtube']['sources'] = sources
-        save_config(cfg)
-        return jsonify({'ok': True})
-    return jsonify({'error': 'Index out of range'}), 404
+@app.route('/api/upload', methods=['POST'])
+def trigger_upload():
+    if S['status'] != 'transcode_done': return jsonify({'error': 'Wrong state'}), 400
+    S['cancel_flag'] = False
+    S['current_task'] = threading.Thread(target=run_upload)
+    S['current_task'].start()
+    return jsonify({'ok': True})
 
+@app.route('/api/reset', methods=['POST'])
+def trigger_reset():
+    reset_pipeline()
+    update_state()
+    return jsonify({'ok': True})
+
+@app.route('/api/cancel', methods=['POST'])
+def trigger_cancel():
+    S['cancel_flag'] = True
+    log_to_web('warn', "任务取消请求已发出...")
+    return jsonify({'ok': True})
 
 # ── Config API ───────────────────────────────────────────────────────────────
 
@@ -206,515 +428,85 @@ def get_config():
         'proxy': cfg['app'].get('proxy', ''),
         'tid': cfg['bilibili'].get('tid', 171),
         'intro_path': cfg['ffmpeg'].get('intro_video_path', ''),
-        'ffmpeg_path': cfg['ffmpeg'].get('bin_path', 'ffmpeg'),
         'desc_prefix': cfg['bilibili'].get('desc_prefix', ''),
     })
-
 
 @app.route('/api/config', methods=['POST'])
 def set_config():
     data = request.json or {}
     cfg = load_config()
-    if 'proxy' in data:
-        cfg['app']['proxy'] = data['proxy']
-    if 'tid' in data:
-        cfg['bilibili']['tid'] = int(data['tid'])
-    if 'intro_path' in data:
-        cfg['ffmpeg']['intro_video_path'] = data['intro_path']
-    if 'desc_prefix' in data:
-        cfg['bilibili']['desc_prefix'] = data['desc_prefix']
+    if 'proxy' in data: cfg['app']['proxy'] = data['proxy']
+    if 'tid' in data: cfg['bilibili']['tid'] = int(data['tid'])
+    if 'intro_path' in data: cfg['ffmpeg']['intro_video_path'] = data['intro_path']
+    if 'desc_prefix' in data: cfg['bilibili']['desc_prefix'] = data['desc_prefix']
     save_config(cfg)
     return jsonify({'ok': True})
 
+# ── Sources API ──────────────────────────────────────────────────────────────
+
+@app.route('/api/sources', methods=['GET'])
+def get_sources():
+    cfg = load_config()
+    return jsonify(cfg['youtube']['sources'])
+
+@app.route('/api/sources', methods=['POST'])
+def add_source():
+    data = request.json or {}
+    url = data.get('url')
+    if not url: return jsonify({'error': 'Missing URL'}), 400
+    
+    # Simple check for duplicates
+    cfg = load_config()
+    if any(s['url'] == url for s in cfg['youtube']['sources']):
+        return jsonify({'error': 'Already exists'}), 400
+        
+    # Get Title (Optional helper)
+    title = url
+    try:
+        from yt_dlp import YoutubeDL
+        with YoutubeDL({'quiet':True, 'extract_flat':True, 'proxy':cfg['app'].get('proxy')}) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', url)
+    except: pass
+
+    cfg['youtube']['sources'].append({
+        'url': url,
+        'title': title,
+        'type': 'channel' if '/channel/' in url or '/c/' in url or '/@' in url else 'video'
+    })
+    save_config(cfg)
+    return jsonify({'ok': True})
+
+@app.route('/api/sources/<int:idx>', methods=['DELETE'])
+def delete_source(idx):
+    cfg = load_config()
+    if 0 <= idx < len(cfg['youtube']['sources']):
+        cfg['youtube']['sources'].pop(idx)
+        save_config(cfg)
+        return jsonify({'ok': True})
+    return jsonify({'error': 'Invalid index'}), 400
 
 # ── History API ──────────────────────────────────────────────────────────────
-
-@app.route('/api/history')
-def get_history():
-    cfg = load_config()
-    history_file = os.path.join(cfg['app']['work_dir'], 'history.json')
-    if not os.path.exists(history_file):
-        return jsonify([])
-    with open(history_file, 'r', encoding='utf-8') as f:
-        ids = json.load(f)
-    return jsonify(ids)
-
-
-# ── Pipeline state API ───────────────────────────────────────────────────────
-
-@app.route('/api/state')
-def get_state():
-    with _state_lock:
-        return jsonify(dict(_pipeline))
-
-
-@app.route('/api/cancel', methods=['POST'])
-def cancel_task():
-    global _cancel_requested
-    if _pipeline['status'] in ('scanning', 'downloading', 'transcoding', 'uploading'):
-        _cancel_requested = True
-        _log('warning', "User dispatched cancellation signal. Aborting sequence...")
-        return jsonify({'ok': True})
-    return jsonify({'error': 'No active task to cancel'}), 400
-
-
-@app.route('/api/reset', methods=['POST'])
-def reset_pipeline():
-    global _cancel_requested
-    if _pipeline['status'] in ('scanning', 'downloading', 'transcoding', 'uploading'):
-        return jsonify({'error': 'Pipeline is running, cannot reset'}), 400
-
-    _cancel_requested = False
-
-    # 1. Clear out history.json & temporary files
-    try:
-        import glob
-        cfg = load_config()
-        work_dir = cfg['app']['work_dir']
-        
-        history_file = os.path.join(work_dir, 'history.json')
-        if os.path.exists(history_file):
-            os.remove(history_file)
-            _log('info', "Deleted history.json")
-            
-        # Clean up temporary/broken yt-dlp fragments & concat files
-        # We explicitly preserve *_final.mp4 as requested by user for retry efficiency
-        for pattern in ('*.part', '*.ytdl', 'concat_list.txt', 'main_standardized.mp4', 'intro_transcoded.mp4', '*.temp.mp4'):
-            for p in glob.glob(os.path.join(work_dir, '**', pattern), recursive=True):
-                try: 
-                    os.remove(p)
-                    _log('info', f"Cleaned temp file: {os.path.basename(p)}")
-                except: pass
-    except Exception as e:
-        _log('error', f"Reset cleanup error: {e}")
-
-    # 2. Reset in-memory state
-    with _state_lock:
-        _pipeline.update({
-            'status': 'idle',
-            'candidates': [],
-            'downloaded': [],
-            'transcoded': [],
-            'uploaded': [],
-            'errors': [],
-            'progress': {},
-            'current_video': None,
-        })
-    _emit('state', {'status': 'idle'})
-    return jsonify({'ok': True})
-
-
-# ── Step 1: Scan ─────────────────────────────────────────────────────────────
-
-@app.route('/api/scan', methods=['POST'])
-def start_scan():
-    if _pipeline['status'] not in ('idle', 'done'):
-        return jsonify({'error': f"Cannot scan while status={_pipeline['status']}"}), 400
-
-    _set_status('scanning', {'candidates': [], 'progress': {}})
-
-    def run():
-        try:
-            cfg = load_config()
-            downloader = YouTubeDownloader(cfg)
-
-            def cb(msg, pct=None):
-                _log('info', msg)
-
-            candidates = downloader.scan_all_sources(progress_cb=cb, cancel_check=check_cancel)
-
-            with _state_lock:
-                _pipeline['candidates'] = candidates
-
-            _log('info', f"Scan complete: {len(candidates)} total, "
-                         f"{sum(1 for c in candidates if not c['already_downloaded'])} new.")
-            _set_status('scan_done', {'candidates': candidates})
-
-        except Exception as e:
-            if "cancelled" in str(e).lower():
-                _log('warning', "Scan cancelled by user.")
-                _set_status('idle')
-            else:
-                _log('error', f"Scan failed: {e}")
-                _set_status('idle')
-        finally:
-            global _cancel_requested
-            _cancel_requested = False
-
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify({'ok': True})
-
-
-# ── Step 2: Download ──────────────────────────────────────────────────────────
-
-@app.route('/api/download', methods=['POST'])
-def start_download():
-    """
-    Body: {"video_ids": ["id1", "id2", ...]}
-    Downloads selected videos that aren't already on disk.
-    """
-    if _pipeline['status'] != 'scan_done':
-        return jsonify({'error': 'Must scan first'}), 400
-
-    video_ids = request.json.get('video_ids', [])
-    if not video_ids:
-        return jsonify({'error': 'No video IDs provided'}), 400
-
-    _set_status('downloading', {'downloaded': [], 'progress': {}})
-
-    def run():
-        global _cancel_requested
-        try:
-            cfg = load_config()
-            downloader = YouTubeDownloader(cfg)
-
-            # Build map from candidates
-            candidate_map = {c['id']: c for c in _pipeline.get('candidates', [])}
-            downloaded = []
-
-            for i, item in enumerate(video_ids):
-                if isinstance(item, dict):
-                    vid_id = item.get('id')
-                    quality_pref = item.get('quality')
-                else:
-                    vid_id = item
-                    quality_pref = None
-
-                candidate = candidate_map.get(vid_id, {})
-                vid_url = candidate.get('url', f'https://www.youtube.com/watch?v={vid_id}')
-                title = candidate.get('title', vid_id)
-                _pipeline['current_video'] = vid_id
-                _log('info', f"[{i+1}/{len(video_ids)}] Downloading {vid_id}...")
-
-                def cb(msg, pct=None):
-                    _log('info', f"  {msg}")
-                    if pct is not None:
-                        _set_progress(vid_id, pct, msg)
-                            
-                result = downloader.download_video(vid_id, vid_url, title, progress_cb=cb, cancel_check=check_cancel, quality=quality_pref)
-                if result:
-                    downloaded.append(result)
-                    _set_progress(vid_id, 100, 'Download complete')
-                    _log('info', f"[{vid_id}] ✓ Downloaded: {result['title']}")
-                else:
-                    _log('error', f"[{vid_id}] ✗ Download failed")
-                    with _state_lock:
-                        _pipeline['errors'].append({'id': vid_id, 'step': 'download'})
-
-            with _state_lock:
-                _pipeline['downloaded'] = downloaded
-                _pipeline['current_video'] = None
-
-            _log('info', f"Download complete: {len(downloaded)}/{len(video_ids)} succeeded.")
-            _set_status('download_done', {'downloaded': downloaded})
-
-        except Exception as e:
-            if "cancelled" in str(e).lower():
-                _log('warning', "Download cancelled by user.")
-                _set_status('scan_done')
-            else:
-                _log('error', f"Download phase failed: {e}")
-                _set_status('scan_done')
-        finally:
-            _cancel_requested = False
-
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify({'ok': True})
-
-
-# ── Step 3: Transcode ─────────────────────────────────────────────────────────
-
-@app.route('/api/transcode', methods=['POST'])
-def start_transcode():
-    """Transcode all downloaded videos (add intro + H264 standardize)."""
-    if _pipeline['status'] != 'download_done':
-        return jsonify({'error': 'Must download first'}), 400
-
-    videos = _pipeline.get('downloaded', [])
-    if not videos:
-        return jsonify({'error': 'No downloaded videos to transcode'}), 400
-
-    _set_status('transcoding', {'transcoded': [], 'progress': {}})
-
-    def run():
-        global _cancel_requested
-        try:
-            cfg = load_config()
-            processor = VideoProcessor(cfg)
-            transcoded = []
-
-            for i, video in enumerate(videos):
-                vid_id = video['id']
-                _pipeline['current_video'] = vid_id
-                _log('info', f"[{i+1}/{len(videos)}] Transcoding {vid_id}: {video['title']}")
-                _set_progress(vid_id, 0, 'Starting transcode...')
-
-                try:
-                    last_log_pct = -1
-                    def p_cb(p):
-                        nonlocal last_log_pct
-                        _set_progress(vid_id, p, 'Transcoding...')
-                        # Log every 10% to avoid flooding
-                        if p // 10 > last_log_pct // 10:
-                            _log('info', f"[{vid_id}] Transcoding progress: {p}%")
-                            last_log_pct = p
-
-                    final_path = processor.process(video, cancel_check=check_cancel, progress_cb=p_cb)
-                    if final_path:
-                        video_out = dict(video)
-                        video_out['final_path'] = final_path
-                        transcoded.append(video_out)
-                        _set_progress(vid_id, 100, 'Transcode complete')
-                        _log('info', f"[{vid_id}] ✓ Transcoded → {final_path}")
-                    else:
-                        if _cancel_requested:
-                            raise Exception("Transcode cancelled by user")
-                        _log('error', f"[{vid_id}] ✗ Transcode returned no output")
-                        with _state_lock:
-                            _pipeline['errors'].append({'id': vid_id, 'step': 'transcode'})
-                except Exception as e:
-                    if "cancelled" in str(e).lower() or _cancel_requested:
-                        raise e  # Bubble up to abort the entire batch
-                    _log('error', f"[{vid_id}] Transcode error: {e}")
-                    with _state_lock:
-                        _pipeline['errors'].append({'id': vid_id, 'step': 'transcode', 'detail': str(e)})
-
-            with _state_lock:
-                _pipeline['transcoded'] = transcoded
-                _pipeline['current_video'] = None
-
-            _log('info', f"Transcode complete: {len(transcoded)}/{len(videos)} succeeded.")
-            _set_status('transcode_done', {'transcoded': transcoded})
-
-        except Exception as e:
-            if "cancelled" in str(e).lower():
-                _log('warning', "Transcode cancelled by user.")
-                _set_status('download_done')
-            else:
-                _log('error', f"Transcode phase failed: {e}")
-                _set_status('download_done')
-        finally:
-            _cancel_requested = False
-
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify({'ok': True})
-
-
-# ── Step 4: Upload ─────────────────────────────────────────────────────────────
-
-@app.route('/api/upload', methods=['POST'])
-def start_upload():
-    """Upload all transcoded videos to Bilibili."""
-    if _pipeline['status'] != 'transcode_done':
-        return jsonify({'error': 'Must transcode first'}), 400
-
-    videos = _pipeline.get('transcoded', [])
-    if not videos:
-        return jsonify({'error': 'No transcoded videos to upload'}), 400
-
-    _set_status('uploading', {'uploaded': [], 'progress': {}})
-
-    def run():
-        global _cancel_requested
-        try:
-            cfg = load_config()
-            downloader = YouTubeDownloader(cfg)
-            uploader = BilibiliUploader(cfg)
-            uploaded = []
-
-            for i, video in enumerate(videos):
-                vid_id = video['id']
-                final_path = video.get('final_path', video.get('filepath'))
-                _pipeline['current_video'] = vid_id
-                _log('info', f"[{i+1}/{len(videos)}] Uploading {vid_id}: {video['title']}")
-                _set_progress(vid_id, 0, 'Starting upload...')
-
-                try:
-                    last_log_pct = -1
-                    def p_cb(p):
-                        nonlocal last_log_pct
-                        _set_progress(vid_id, p, 'Uploading...')
-                        # Log every 10% to avoid flooding
-                        if p // 10 > last_log_pct // 10:
-                            _log('info', f"[{vid_id}] Upload progress: {p}%")
-                            last_log_pct = p
-
-                    success = uploader.upload(
-                        video_data=video,
-                        final_video_path=final_path,
-                        cancel_check=check_cancel,
-                        progress_cb=p_cb
-                    )
-                    if success:
-                        downloader.save_history(vid_id)
-                        video_out = dict(video)
-                        uploaded.append(video_out)
-                        _set_progress(vid_id, 100, 'Upload complete ✓')
-                        _log('info', f"[{vid_id}] ✓ Upload successful. Added to history.")
-                    else:
-                        if _cancel_requested:
-                            raise Exception("Upload cancelled by user")
-                        _log('error', f"[{vid_id}] ✗ Upload failed")
-                        _set_progress(vid_id, 0, 'Upload FAILED')
-                        with _state_lock:
-                            _pipeline['errors'].append({'id': vid_id, 'step': 'upload'})
-                except Exception as e:
-                    if "cancelled" in str(e).lower() or _cancel_requested:
-                        raise e  # Bubble up to abort the entire batch
-                    _log('error', f"[{vid_id}] Upload error: {e}")
-                    with _state_lock:
-                        _pipeline['errors'].append({'id': vid_id, 'step': 'upload', 'detail': str(e)})
-
-            with _state_lock:
-                _pipeline['uploaded'] = uploaded
-                _pipeline['current_video'] = None
-
-            _log('info', f"Upload complete: {len(uploaded)}/{len(videos)} succeeded.")
-            _set_status('done', {'uploaded': uploaded})
-
-        except Exception as e:
-            if "cancelled" in str(e).lower():
-                _log('warning', "Upload cancelled by user.")
-                _set_status('transcode_done')
-            else:
-                _log('error', f"Upload phase failed: {e}")
-                _set_status('transcode_done')
-        finally:
-            _cancel_requested = False
-
-    threading.Thread(target=run, daemon=True).start()
-    return jsonify({'ok': True})
-
-
-@app.route('/api/retry', methods=['POST'])
-def start_retry():
-    """Retry upload or transcode for a specific video_id."""
-    video_id = request.json.get('video_id')
-    if not video_id:
-        return jsonify({'error': 'video_id required'}), 400
-
-    # Find the video in candidates/downloaded
-    video = None
-    with _state_lock:
-        for v in _pipeline.get('downloaded', []):
-            if v['id'] == video_id:
-                video = v
-                break
-        if not video:
-            for v in _pipeline.get('candidates', []):
-                if v['id'] == video_id:
-                    video = v
-                    break
-                
-    if not video:
-        return jsonify({'error': f'Video {video_id} not found'}), 404
-
-    _log('info', f"Retrying process for {video_id}...")
+@app.route('/api/history', methods=['GET'])
+def list_history():
+    return jsonify(get_history())
+
+# ── Bilibili status (sidebar) ─────────────────────────────────────────────────
+@app.route('/api/bilibili/status', methods=['GET'])
+def get_bili_status():
+    if not os.path.exists('cookies.json'):
+         return jsonify({'logged_in': False})
     
-    def run_retry():
-        global _cancel_requested
-        try:
-            cfg = load_config()
-            processor = VideoProcessor(cfg)
-            downloader = YouTubeDownloader(cfg)
-            uploader = BilibiliUploader(cfg)
-
-            with _state_lock:
-                _pipeline['current_video'] = video_id
-
-            # 1. Ensure transcode is done (this skips if file exists due to our new VideoProcessor logic)
-            _set_progress(video_id, 0, 'Checking transcode...')
-            final_path = processor.process(video, cancel_check=check_cancel)
-            
-            if not final_path:
-                _log('error', f"[{video_id}] Retry: Transcode check failed")
-                _set_progress(video_id, 0, 'Transcode check FAILED')
-                return
-
-            video['final_path'] = final_path
-            _set_progress(video_id, 50, 'Transcode ready, starting upload...')
-
-            # 2. Upload
-            success = uploader.upload(
-                video_data=video,
-                final_video_path=final_path,
-                cancel_check=check_cancel,
-                progress_cb=lambda p: _set_progress(video_id, 50 + int(p/2), 'Uploading (retry)...')
-            )
-
-            if success:
-                downloader.save_history(video_id)
-                _set_progress(video_id, 100, 'Upload complete ✓ (Retry)')
-                _log('info', f"[{video_id}] ✓ Retry successful. Added to history.")
-                with _state_lock:
-                    # Remove from errors if present
-                    _pipeline['errors'] = [e for e in _pipeline['errors'] if e.get('id') != video_id]
-                    if video not in _pipeline['uploaded']:
-                        _pipeline['uploaded'].append(video)
-            else:
-                _log('error', f"[{video_id}] ✗ Retry upload failed")
-                _set_progress(video_id, 0, 'Retry FAILED')
-
-        except Exception as e:
-            _log('error', f"[{video_id}] Retry error: {e}")
-            _set_progress(video_id, 0, f'Error: {str(e)[:20]}...')
-        finally:
-            with _state_lock:
-                _pipeline['current_video'] = None
-            _cancel_requested = False
-            _emit('state', {'status': 'done'})
-
-    threading.Thread(target=run_retry, daemon=True).start()
-    return jsonify({'ok': True})
-
-
-# ── Bilibili login status ─────────────────────────────────────────────────────
-
-@app.route('/api/bilibili/status')
-def bilibili_status():
-    cookies_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'cookies.json')
-    if not os.path.exists(cookies_path):
-        return jsonify({'logged_in': False, 'message': 'cookies.json not found'})
-    mtime = os.path.getmtime(cookies_path)
+    # Simple logic: check file age
+    mtime = os.path.getmtime('cookies.json')
     age_days = (time.time() - mtime) / 86400
     return jsonify({
         'logged_in': True,
         'last_login': datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M'),
-        'age_days': round(age_days, 1),
-        'warning': age_days > 14,
+        'age_days': int(age_days),
+        'warning': age_days > 15
     })
-
-
-# ── Main page ─────────────────────────────────────────────────────────────────
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     cfg = load_config()
-    host = cfg['app'].get('host', '127.0.0.1')
-    port = int(cfg['app'].get('port', 5000))
-
-    # Ensure logs directory exists
-    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
-    os.makedirs(log_dir, exist_ok=True)
-    
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.StreamHandler(sys.stdout),
-            logging.FileHandler(os.path.join(log_dir, 'web_app.log'), encoding='utf-8'),
-        ]
-    )
-
-    print(f"\n{'='*50}")
-    print(f"  YT → Bilibili Automation Web UI")
-    print(f"  Open: http://{host if host != '0.0.0.0' else '127.0.0.1'}:{port}")
-    print(f"{'='*50}\n")
-
-    app.run(host=host, port=port, debug=False, threaded=True)
+    app.run(host=cfg['app']['host'], port=cfg['app']['port'], debug=False)

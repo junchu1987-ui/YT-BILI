@@ -1,5 +1,6 @@
 @echo off
 chcp 65001 >nul
+cd /d %~dp0
 title YT-BI-Anti Web UI
 
 :: Use venv if available, otherwise use system Python

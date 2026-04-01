@@ -9,16 +9,20 @@ class VideoProcessor:
         self.ffmpeg_path = config['ffmpeg'].get('bin_path', 'ffmpeg')
         self.intro_path = config['ffmpeg'].get('intro_video_path', '')
         self.work_dir = config['app']['work_dir']
-        self.has_nvenc = self._check_nvenc()
+        self.has_nvenc = self._check_encoder('h264_nvenc')
+        self.has_qsv = self._check_encoder('h264_qsv')
+        
         if self.has_nvenc:
             logging.info("NVIDIA NVENC detected. GPU encoding enabled.")
+        elif self.has_qsv:
+            logging.info("Intel QSV detected. GPU encoding enabled.")
         else:
-            logging.info("NVENC not found. Using CPU encoding (libx264).")
+            logging.info("No supported GPU encoders found. Using CPU encoding (libx264).")
 
-    def _check_nvenc(self):
+    def _check_encoder(self, encoder_name):
         try:
             res = subprocess.run([self.ffmpeg_path, '-hide_banner', '-encoders'], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-            return 'h264_nvenc' in res.stdout
+            return encoder_name in res.stdout
         except:
             return False
 
@@ -65,28 +69,37 @@ class VideoProcessor:
             raise subprocess.CalledProcessError(proc.returncode, cmd, output="".join(output).encode('utf-8'))
         return True
 
-    def _run_ffmpeg_with_fallback(self, cmd_nvenc_full, cmd_nvenc_hybrid, cmd_cpu, cancel_check=None, progress_cb=None, duration_us=None):
+    def _run_ffmpeg_with_fallback(self, cmd_nvenc_full, cmd_nvenc_hybrid, cmd_qsv, cmd_cpu, cancel_check=None, progress_cb=None, duration_us=None):
         def inject_progress_flags(cmd):
             return cmd[:-1] + ['-progress', 'pipe:1', '-nostats'] + [cmd[-1]]
 
+        # STAGE 1: NVIDIA GPU (NVENC)
         if self.has_nvenc:
-            # STAGE 1: Full GPU (Zero-Copy)
             try:
-                logging.info("Attempting Full GPU Transcoding (Zero-Copy)...")
+                logging.info("Attempting Full GPU Transcoding (NVENC Zero-Copy)...")
                 self._run_proc(inject_progress_flags(cmd_nvenc_full), cancel_check, progress_cb, duration_us)
                 return True
             except Exception as e:
                 if "cancelled" in str(e).lower(): raise
-                logging.warning(f"Full GPU failed, attempting Hybrid GPU... Error: {str(e)[-100:]}")
+                logging.warning(f"Full NVENC failed, attempting Hybrid NVENC... Error: {str(e)[-100:]}")
             
-            # STAGE 2: Hybrid GPU (CPU Decode -> GPU Scale/Encode)
             try:
-                logging.info("Attempting Hybrid GPU Transcoding (CPU Decode + GPU Scale/Encode)...")
+                logging.info("Attempting Hybrid GPU Transcoding (NVENC + CPU Decode)...")
                 self._run_proc(inject_progress_flags(cmd_nvenc_hybrid), cancel_check, progress_cb, duration_us)
                 return True
             except Exception as e:
                 if "cancelled" in str(e).lower(): raise
-                logging.warning(f"Hybrid GPU failed, falling back to CPU... Error: {str(e)[-100:]}")
+                logging.warning(f"Hybrid NVENC failed, falling back... Error: {str(e)[-100:]}")
+
+        # STAGE 2: Intel GPU (QSV)
+        if self.has_qsv:
+            try:
+                logging.info("Attempting Intel QSV Transcoding...")
+                self._run_proc(inject_progress_flags(cmd_qsv), cancel_check, progress_cb, duration_us)
+                return True
+            except Exception as e:
+                if "cancelled" in str(e).lower(): raise
+                logging.warning(f"Intel QSV failed, falling back to CPU... Error: {str(e)[-100:]}")
 
         # STAGE 3: Full CPU (Legacy)
         try:
@@ -172,7 +185,18 @@ class VideoProcessor:
             transcoded_intro_path
         ]
 
-        # STAGE 3: Full CPU
+        # STAGE 3: Intel QSV
+        cmd_qsv = [
+            self.ffmpeg_path, '-y',
+            '-i', self.intro_path,
+            '-vf', f'vpp_qsv=w={width}:h={height},format=nv12',
+            '-r', str(fps),
+            '-c:v', 'h264_qsv', '-global_quality', '23', '-look_ahead', '1',
+            '-c:a', 'aac', '-ar', '44100',
+            transcoded_intro_path
+        ]
+
+        # STAGE 4: Full CPU
         cmd_cpu = [
             self.ffmpeg_path, '-y',
             '-i', self.intro_path,
@@ -184,7 +208,7 @@ class VideoProcessor:
         ]
         
         try:
-            if self._run_ffmpeg_with_fallback(cmd_nvenc_full, cmd_nvenc_hybrid, cmd_cpu, cancel_check):
+            if self._run_ffmpeg_with_fallback(cmd_nvenc_full, cmd_nvenc_hybrid, cmd_qsv, cmd_cpu, cancel_check):
                 return transcoded_intro_path
         except Exception as e:
             logging.error(f"Intro transcode failed: {e}. Cleaning up partial file...")
@@ -253,7 +277,17 @@ class VideoProcessor:
                     standardized_main
                 ]
 
-                # STAGE 3: Full CPU Fallback
+                # STAGE 3: Intel QSV
+                cmd_qsv = [
+                    self.ffmpeg_path, '-y',
+                    '-i', filepath,
+                    '-vf', f'vpp_qsv=w={target_w}:h={target_h},format=nv12',
+                    '-c:v', 'h264_qsv', '-global_quality', '23', '-look_ahead', '1',
+                    '-c:a', 'aac',
+                    standardized_main
+                ]
+
+                # STAGE 4: Full CPU Fallback
                 cmd_cpu = [
                     self.ffmpeg_path, '-y',
                     '-i', filepath,
@@ -263,7 +297,7 @@ class VideoProcessor:
                     standardized_main
                 ]
                 
-                if not self._run_ffmpeg_with_fallback(cmd_nvenc_full, cmd_nvenc_hybrid, cmd_cpu, cancel_check, progress_cb, main_info.get('duration_us')):
+                if not self._run_ffmpeg_with_fallback(cmd_nvenc_full, cmd_nvenc_hybrid, cmd_qsv, cmd_cpu, cancel_check, progress_cb, main_info.get('duration_us')):
                     raise Exception("Transcoding failed across all stages.")
 
             # Step 4: Concat if intro exists, else standardized_main is our final result

@@ -498,14 +498,12 @@ document.getElementById('btn-save-config').addEventListener('click', async () =>
     proxy:      document.getElementById('cfg-proxy').value.trim(),
     tid:        parseInt(document.getElementById('cfg-tid').value) || 171,
     intro_path: document.getElementById('cfg-intro').value.trim(),
-    desc_prefix:document.getElementById('cfg-desc').value,
+    desc_prefix: document.getElementById('cfg-desc').value.trim(),
   };
-  const res = await api('POST', '/api/config', cfg);
-  if (res && res.ok) {
-    const ok = document.getElementById('save-ok');
-    ok.style.display = '';
-    setTimeout(() => { ok.style.display = 'none'; }, 2500);
-  }
+  await api('POST', '/api/config', cfg);
+  const ok = document.getElementById('save-config-ok');
+  ok.style.display = 'inline';
+  setTimeout(() => ok.style.display = 'none', 2000);
 });
 
 // ── Bilibili status (sidebar) ─────────────────────────────────────────────────

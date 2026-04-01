@@ -1,198 +1,121 @@
 import os
-import subprocess
+import re
+import json
 import logging
+import subprocess
+import time
+from datetime import datetime
+from cover_processor import CoverProcessor
+
+logger = logging.getLogger(__name__)
 
 class BilibiliUploader:
     def __init__(self, config):
         self.config = config
-        self.tid = config['bilibili'].get('tid', 17)
-        self.work_dir = config['app']['work_dir']
-        self.desc_prefix_template = config['bilibili'].get(
-            'desc_prefix',
-            '本视频搬运自YouTube。\n原视频链接：{youtube_url}\n\n'
-        )
-        self.biliup_path = self._get_executable_path('biliup')
-        self.ffmpeg_path = self._get_executable_path('ffmpeg')
+        self.biliup_path = self._find_biliup()
+        self.cookie_file = 'cookies.json'
+        self.cover_proc = CoverProcessor(config)
 
-    def _get_executable_path(self, name):
-        """Finds the absolute path of an executable, prioritizing the venv Scripts folder."""
-        import sys
-        import shutil
-        # Check venv Scripts/bin first
-        scripts_dir = os.path.join(sys.prefix, 'Scripts') if os.name == 'nt' else os.path.join(sys.prefix, 'bin')
-        ext = ".exe" if os.name == 'nt' else ""
-        exe_path = os.path.join(scripts_dir, f"{name}{ext}")
-        if os.path.exists(exe_path):
-            return exe_path
-        # Fallback to system PATH
-        return shutil.which(name) or name
+    def _find_biliup(self):
+        # Look in current dir or PATH
+        if os.path.exists('biliup.exe'):
+            return os.path.abspath('biliup.exe')
+        return 'biliup' # assume in PATH
 
-    def upload(self, video_data, final_video_path, cancel_check=None, progress_cb=None):
+    def upload(self, file_path, title, source_url, original_thumbnail=None, progress_callback=None):
         """
-        Uploads the given video to Bilibili using `biliup` CLI.
-        Assumes `biliup` is installed and `cookies.json` is in the working directory.
+        Uploads a video to Bilibili using the biliup CLI.
+        Features: Retry logic (3x), Automated Cover Generation with Baidu ERNIE + Pillow.
         """
-        if not os.path.exists(final_video_path):
-            logging.error(f"Cannot upload missing video: {final_video_path}")
-            return False
+        if not os.path.exists(self.cookie_file):
+            raise Exception("cookies.json not found. Please login via biliup first.")
 
-        title = video_data.get('title', 'Unknown Title')
-        youtube_url = video_data.get('youtube_url', '')
-        raw_desc = video_data.get('description', '') or ''
-
-        # --- Auto Translation (With Timeout) ---
-        def translate_with_timeout(text, timeout=10):
+        # Step 1: Automated Cover Processing
+        cover_path = None
+        if original_thumbnail and os.path.exists(original_thumbnail):
             try:
-                import translators as ts
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(ts.translate_text, text, translator='bing', to_language='zh-Hans')
-                    return future.result(timeout=timeout)
+                # 1.1 Generate LLM summary (1-2 words)
+                summary_text = self.cover_proc.get_summary(title)
+                # 1.2 Generate artistic cover
+                cover_path = os.path.join(os.path.dirname(file_path), "cover_custom.jpg")
+                if self.cover_proc.generate_cover(original_thumbnail, summary_text, cover_path):
+                    logger.info(f"Custom cover generated for upload: {cover_path}")
+                else:
+                    cover_path = original_thumbnail # Fallback to original
             except Exception as e:
-                logging.warning(f"Translation skip (timeout or error: {e})")
-                return None
+                logger.error(f"Cover processing failed: {e}. Falling back to default.")
+                cover_path = original_thumbnail
 
-        if title and title != 'Unknown Title':
-            logging.info(f"Translating Title via [bing] (10s timeout)...")
-            trans_title = translate_with_timeout(title)
-            if trans_title:
-                logging.info(f"Translated Title: {trans_title}")
-                title = trans_title
+        tid = self.config['bilibili'].get('tid', 171)
+        desc_prefix = self.config['bilibili'].get('desc_prefix', '')
+        description = desc_prefix.replace('{youtube_url}', source_url)
+        tags = ["YouTube", "Automated", "搬运"]
 
-        if raw_desc:
-            logging.info(f"Translating Description via [bing] (10s timeout)...")
-            short_desc = raw_desc[:400]
-            trans_desc = translate_with_timeout(short_desc)
-            if trans_desc:
-                logging.info("Translated Description successfully.")
-                raw_desc = trans_desc
-
-        # Ensure length limits
-        title = title[:80]
-        
-        # Build description: configurable prefix + translated desc
-        prefix = self.desc_prefix_template.format(youtube_url=youtube_url)
-        full_desc = (prefix + raw_desc)[:500]
-        
-        logging.info(f"Uploading to Bilibili: {title}")
-        
-        # Dynamic Tags: Extract from metadata, merge with defaults, and sanitize.
-        # Bilibili limits: max 10 tags, max 20 chars per tag.
-        meta_tags = video_data.get('tags', []) or []
-        base_tags = ['YouTube', '创意']
-        combined_tags = []
-        seen = set()
-        for t in base_tags + meta_tags:
-            t_clean = str(t).strip()[:20]
-            if t_clean and t_clean not in seen:
-                combined_tags.append(t_clean)
-                seen.add(t_clean)
-            if len(combined_tags) >= 10: break
-            
-        tag_str = ','.join(combined_tags)
-        
-        logging.info(f"Uploading to Bilibili: {title} with tags: {tag_str}")
-        
+        # Step 2: Upload Command
         cmd = [
-            self.biliup_path,
-            'upload',
-            final_video_path,
+            self.biliup_path, 'upload', file_path,
             '--title', title,
-            '--desc', full_desc,
-            '--tid', str(self.tid),
-            '--copyright', '1',
-            '--tag', tag_str
+            '--tid', str(tid),
+            '--tag', ','.join(tags),
+            '--desc', description,
+            '--copyright', '1' # Always mark as Original (Bilibili policy for automated uploads)
         ]
         
-        # Attach cover image if available
-        cover_path = video_data.get('cover_path')
         if cover_path and os.path.exists(cover_path):
-            # Bilibili API strictly rejects .webp formats with -400 Bad Request
-            if cover_path.lower().endswith('.webp'):
-                logging.info(f"Converting unsupported .webp cover to .jpg for Bilibili...")
-                jpg_cover = cover_path.rsplit('.', 1)[0] + '.jpg'
-                if not os.path.exists(jpg_cover):
-                    # Quickly strip the webp format into standard jpeg
-                    subprocess.run([self.ffmpeg_path, '-y', '-i', cover_path, jpg_cover], 
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                
-                if os.path.exists(jpg_cover):
-                    cmd.extend(['--cover', jpg_cover])
-            else:
-                cmd.extend(['--cover', cover_path])
-        
-        # Prepare the environment with proxy if configured
-        env = os.environ.copy()
-        env['PYTHONUTF8'] = "1"  # Fix biliup GBK char print issues on Windows
-        proxy = self.config['app'].get('proxy', '')
-        if proxy:
-            env['HTTP_PROXY'] = proxy
-            env['HTTPS_PROXY'] = proxy
-            env['http_proxy'] = proxy
-            env['https_proxy'] = proxy
+            cmd += ['--cover', cover_path]
 
-        try:
-            # Stream output in real-time to avoid freezing the UI during long uploads
-            process = subprocess.Popen(
-                cmd, 
-                stdout=subprocess.PIPE, 
-                stderr=subprocess.STDOUT, 
-                env=env,
-                text=True,
-                encoding='utf-8',
-                errors='replace',
-                bufsize=1
-            )
-            
-            # Read stdout in a separate thread so the main loop can poll cancel_check instantly
-            import threading
-            import time
-            import re
-            def log_reader(pipe):
-                try:
-                    for line in pipe:
-                        # Clean ANSI escape codes (biliup output often includes them)
-                        line = re.sub(r'\x1b\[[0-9;]*m', '', line).strip()
+        # Step 3: Retry Loop (3x)
+        max_retries = 3
+        for attempt in range(max_retries):
+            logger.info(f"Starting Bilibili upload (Attempt {attempt+1}/{max_retries}): {title}")
+            try:
+                # We use raw subprocess to capture \r based progress streams
+                process = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding='utf-8',
+                    errors='replace',
+                    bufsize=1
+                )
+
+                # Special loop to handle \r without standard line splitting
+                buffer = ""
+                while True:
+                    char = process.stdout.read(1)
+                    if not char and process.poll() is not None:
+                        break
+                    
+                    if char == '\r' or char == '\n':
+                        # Process the "line" (up to \r)
+                        line = buffer.strip()
                         if line:
-                            logging.info(f"[biliup] {line}")
+                            # Parse progress percentage e.g. [#######] 45%
+                            # Using regex for precision
+                            pct_match = re.search(r'(\d+)%', line)
+                            if pct_match:
+                                pct = int(pct_match.group(1))
+                                if progress_callback:
+                                    progress_callback(pct, f"Bilibili上传中... {pct}%")
                             
-                            # Extract percentage: watch for "50.0%" or "50%" or "[50%]"
-                            if progress_cb:
-                                match = re.search(r'(\d+(?:\.\d+)?)%', line)
-                                if match:
-                                    try:
-                                        pct = int(float(match.group(1)))
-                                        if pct > 99: pct = 99
-                                        progress_cb(pct)
-                                    except:
-                                        pass
-                except Exception:
-                    pass
-            
-            reader_thread = threading.Thread(target=log_reader, args=(process.stdout,), daemon=True)
-            reader_thread.start()
+                            # Log critical info but avoid flooding for every \r update
+                            if "Upload success" in line or "投稿成功" in line:
+                                logger.info(f"Bilibili upload success: {title}")
+                        
+                        buffer = "" # clear for next segment
+                    else:
+                        buffer += char
 
-            # Main polling loop
-            while process.poll() is None:
-                if cancel_check and cancel_check():
-                    logging.warning("Cancellation requested during upload. Terminating biliup...")
-                    process.terminate()
-                    try:
-                        process.wait(timeout=3)
-                    except subprocess.TimeoutExpired:
-                        # Hard kill if terminate failed
-                        subprocess.run(['taskkill', '/F', '/T', '/PID', str(process.pid)], 
-                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                    raise Exception("Upload cancelled by user")
-                time.sleep(0.5)
-            
-            process.wait()
-            if process.returncode == 0:
-                logging.info("Upload completed successfully.")
-                return True
-            else:
-                logging.error(f"Upload failed with exit code {process.returncode}")
-                return False
-        except Exception as e:
-            logging.error(f"Upload process experienced an error: {e}")
-            return False
+                process.wait()
+                if process.returncode == 0:
+                    return True
+                else:
+                    logger.warning(f"Upload attempt {attempt+1} failed with exit code: {process.returncode}")
+                    time.sleep(5) # Cooldown before retry
+
+            except Exception as e:
+                logger.error(f"Error during Bilibili upload attempt {attempt+1}: {e}")
+                time.sleep(5)
+        
+        return False

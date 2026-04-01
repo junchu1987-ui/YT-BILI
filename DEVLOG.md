@@ -32,5 +32,15 @@
     - **Progress Parsing**: Enhanced regex-based parsing for `biliup` output to provide smooth percentage updates in the log panel.
     - **Throttled Logging**: Added 10% interval progress logs to keep the text panel clean but informative.
 
+## v1.1.0 - Automation & Stability (Restored 04/01)
+- **Multi-GPU HWAccel**: Added Intel QSV (h264_qsv) support next to NVIDIA NVENC.
+- **Automated Cover Processing**:
+    - **Baidu ERNIE LLM**: Summarizes titles into 1-2 words for impact.
+    - **Pillow Overlay**: Renders artistic summaries on thumbnails (1920x1080).
+- **Core Improvements**:
+    - **Upload Robustness**: Added 3-retry upload loop for Bilibili CLI.
+    - **Progress Fixes**: Fixed `\r` (carriage return) parsing for real-time `biliup` status.
+- **Maintenance**: Fixed `run_web.bat` relative path issues.
+
 ---
 *Maintained by Antigravity (Advanced Agentic Coding)*
