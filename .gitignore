@@ -39,6 +39,9 @@ youtube_cookies.txt
 qrcode.png
 *.cookie
 
+# Large binaries
+bin/
+
 # Logs & Temp
 *.log
 logs/
