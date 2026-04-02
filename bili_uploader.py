@@ -31,7 +31,7 @@ class BilibiliUploader:
                 return p
         return 'biliup' # assume in PATH
 
-    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None):
+    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None):
         """
         Uploads a video to Bilibili using the biliup CLI.
         Features: AI-Translation, Robust Retry, Automated Cover.
@@ -69,12 +69,12 @@ class BilibiliUploader:
                 logger.error(f"Cover processing failed: {e}")
                 cover_path = os.path.abspath(original_thumbnail)
 
-        tid = self.config['bilibili'].get('tid', 171)
+        tid = tid_override if tid_override is not None else self.config['bilibili'].get('tid', 171)
         desc_prefix = self.config['bilibili'].get('desc_prefix', '')
-        
+
         # Combine translated description with original link and prefix
         final_description = f"{bili_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
-        tags = ["YouTube", "Automated", "搬运", "AI翻译", "中字"]
+        tags = tags_override if tags_override is not None else ["YouTube", "Automated", "搬运", "AI翻译", "中字"]
 
         # Step 3: Upload Command
         cmd = [
@@ -102,35 +102,37 @@ class BilibiliUploader:
                     text=True,
                     encoding='utf-8',
                     errors='replace',
-                    bufsize=1
+                    bufsize=1,
+                    universal_newlines=True
                 )
 
-                # Special loop to handle \r without standard line splitting
-                buffer = ""
+                # Read output line-by-line; handle \r-terminated progress lines
+                # by treating \r as a line separator via universal newlines mode.
                 full_output = []
+                upload_timeout = 3600  # 1 hour max per upload attempt
+                deadline = time.time() + upload_timeout
                 while True:
-                    char = process.stdout.read(1)
-                    if not char and process.poll() is not None:
-                        break
-                    
-                    if char == '\r' or char == '\n':
-                        # Process the "line" (up to \r)
-                        line = buffer.strip()
-                        if line:
-                            full_output.append(line)
-                            # Parse progress percentage e.g. [#######] 45%
-                            pct_match = re.search(r'(\d+)%', line)
-                            if pct_match:
-                                pct = int(pct_match.group(1))
-                                if progress_callback:
-                                    progress_callback(pct, f"Bilibili上传中... {pct}%")
-                            
-                            if "Upload success" in line or "投稿成功" in line:
-                                logger.info(f"Bilibili upload success: {title}")
-                        
-                        buffer = "" # clear for next segment
-                    else:
-                        buffer += char
+                    if time.time() > deadline:
+                        process.kill()
+                        raise Exception("Upload timed out after 1 hour")
+                    line_raw = process.stdout.readline()
+                    if not line_raw:
+                        if process.poll() is not None:
+                            break
+                        continue
+                    line = line_raw.rstrip('\r\n').strip()
+                    if not line:
+                        continue
+                    full_output.append(line)
+                    # Parse progress percentage e.g. [#######] 45%
+                    pct_match = re.search(r'(\d+)%', line)
+                    if pct_match:
+                        pct = int(pct_match.group(1))
+                        if progress_callback:
+                            progress_callback(pct, f"Bilibili上传中... {pct}%")
+
+                    if "Upload success" in line or "投稿成功" in line:
+                        logger.info(f"Bilibili upload success: {title}")
 
                 process.wait()
                 if process.returncode == 0:

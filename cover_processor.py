@@ -1,8 +1,5 @@
 import os
-import requests
 import logging
-import hashlib
-import random
 from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
@@ -10,62 +7,78 @@ logger = logging.getLogger(__name__)
 class CoverProcessor:
     def __init__(self, config):
         self.config = config
-        # Baidu Translation API Credentials
-        self.appid = config.get('baidu_fanyi', {}).get('appid', '20260331002584381')
-        self.security_key = config.get('baidu_fanyi', {}).get('security_key', 'mMtnO6Yz7wXqI5Rhsuj1')
         
-    def _call_fanyi(self, text, from_lang='en', to_lang='zh'):
-        """Calls the Baidu Translation API (Standard Edition) with MD5 signature."""
-        if not text: return ""
-        
-        url = "http://api.fanyi.baidu.com/api/trans/vip/translate"
-        salt = str(random.randint(32768, 65536))
-        
-        # sign = appid + q + salt + security_key
-        sign_str = self.appid + text + salt + self.security_key
-        sign = hashlib.md5(sign_str.encode('utf-8')).hexdigest()
-        
-        params = {
-            'q': text,
-            'from': from_lang,
-            'to': to_lang,
-            'appid': self.appid,
-            'salt': salt,
-            'sign': sign
-        }
-        
+    def _call_glm(self, messages, max_tokens=512):
+        """Calls GLM-4-Flash. Returns response text or None on failure."""
+        api_key = self.config.get('zhipu', {}).get('api_key', '')
+        if not api_key:
+            return None
         try:
-            response = requests.get(url, params=params, timeout=10)
-            result = response.json()
-            if 'trans_result' in result:
-                # Return the translated text
-                return result['trans_result'][0]['dst']
-            else:
-                logger.error(f"Baidu Translation API Error: {result}")
-                return text # Fallback to original
+            from zhipuai import ZhipuAI
+            client = ZhipuAI(api_key=api_key)
+            resp = client.chat.completions.create(
+                model="glm-4-flash",
+                messages=messages,
+                max_tokens=max_tokens,
+                timeout=15
+            )
+            return resp.choices[0].message.content.strip()
         except Exception as e:
-            logger.error(f"Baidu Translation request failed: {e}")
-            return text
+            logger.error(f"GLM API call failed: {e}")
+            return None
 
     def translate_title(self, title):
-        """Translates YouTube title to Chinese using Baidu Translation API."""
-        return self._call_fanyi(title)
+        """Translates YouTube title to Chinese using GLM-4-Flash."""
+        if not title: return ""
+        result = self._call_glm([{
+            "role": "user",
+            "content": (
+                "将以下YouTube视频标题翻译成中文，使用中国大陆日常口语表达，"
+                "专有名词用国内常见叫法（如scooter译为电瓶车/摩托车，根据语境判断）。"
+                "只输出翻译结果，不要解释：\n"
+                f"{title}"
+            )
+        }], max_tokens=100)
+        return result if result else title
 
     def translate_description(self, desc):
-        """Translates YouTube description to Chinese using Baidu Translation API."""
+        """Translates YouTube description to Chinese using GLM-4-Flash."""
         if not desc: return ""
-        # Handle large descriptions by translating paragraphs (Baidu limit is 6000 bytes)
-        # For simplicity, we just take the first 4000 characters
-        return self._call_fanyi(desc[:4000])
+        result = self._call_glm([{
+            "role": "user",
+            "content": f"将以下YouTube视频简介翻译成中文，只输出翻译结果，不要解释：{desc[:3000]}"
+        }], max_tokens=1000)
+        return result if result else desc
 
     def get_summary(self, title_cn):
-        """Extracts 4-6 catchy characters from the Chinese title for the cover."""
-        # Since we use simple translation API, we'll take the first 6 characters 
-        # or most impactful part of the Chinese title.
-        clean_text = "".join(filter(lambda x: '\u4e00' <= x <= '\u9fa5' or x.isalnum(), title_cn))
-        if len(clean_text) > 6:
-            return clean_text[:6]
-        return clean_text if len(clean_text) >= 2 else "精品推荐"
+        """Calls GLM-4-Flash to extract 4-6 meaningful Chinese characters from the title."""
+        def _fallback(text):
+            clean = "".join(c for c in text if '\u4e00' <= c <= '\u9fa5')
+            if len(clean) > 6:
+                return clean[:6]
+            return clean if len(clean) >= 2 else "精品推荐"
+
+        # If title has no Chinese, translate it first
+        has_chinese = any('\u4e00' <= c <= '\u9fa5' for c in title_cn)
+        input_title = title_cn if has_chinese else self.translate_title(title_cn)
+
+        result = self._call_glm([{
+            "role": "user",
+            "content": (
+                "你是一个视频封面文案专家。根据视频标题，提炼一个4到6个汉字的封面标语，"
+                "要求语义完整、朗朗上口，字数够用即可不必凑满6字。"
+                "只输出标语本身，不要标点、不要解释。\n"
+                f"标题：{input_title}"
+            )
+        }], max_tokens=20)
+
+        if result:
+            chinese_only = "".join(c for c in result if '\u4e00' <= c <= '\u9fa5')
+            if len(chinese_only) >= 2:
+                return chinese_only[:6]
+
+        logger.warning(f"GLM summary insufficient, using fallback for: {input_title}")
+        return _fallback(input_title)
 
     def generate_cover(self, source_image_path, text, output_path):
         """Processes the thumbnail: 1920x1080, 10-degree tilted artistic text at bottom-right."""
@@ -109,11 +122,10 @@ class CoverProcessor:
             d.text((x, y), text, font=font, fill=(255, 255, 255, 255))
             
             # Rotate the WHOLE layer by 10 degrees
-            text_img = txt_layer.crop((max(0, x-50), max(0, y-50), 1920, 1080))
-            rotated_text = text_img.rotate(10, resample=Image.BICUBIC, expand=True)
-            
-            # Composite rotated text back
-            img.paste(rotated_text, (max(0, x-50), max(0, y-50)), rotated_text)
+            # expand=True changes the canvas size, so we rotate the whole layer
+            # and then composite it onto the image using alpha compositing.
+            rotated_layer = txt_layer.rotate(-10, resample=Image.BICUBIC, expand=False)
+            img = Image.alpha_composite(img, rotated_layer)
             
             # Step 3: Save as JPEG for Bilibili
             final_img = img.convert("RGB")

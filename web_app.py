@@ -31,6 +31,8 @@ logger = logging.getLogger(__name__)
 
 # ── App Init ─────────────────────────────────────────────────────────────────
 app = Flask(__name__)
+state_lock = threading.Lock()
+history_lock = threading.Lock()
 # Global state for pipeline
 S = {
     'status': 'idle',      # idle, scanning, scan_done, downloading, download_done, transcoding, transcode_done, uploading, done
@@ -45,15 +47,16 @@ S = {
 }
 
 def reset_pipeline():
-    S['status'] = 'idle'
-    S['candidates'] = []
-    S['downloaded'] = []
-    S['transcoded'] = []
-    S['uploaded'] = []
-    S['errors'] = []
-    S['progress'] = {}
-    S['cancel_flag'] = False
-    S['current_task'] = None
+    with state_lock:
+        S['status'] = 'idle'
+        S['candidates'] = []
+        S['downloaded'] = []
+        S['transcoded'] = []
+        S['uploaded'] = []
+        S['errors'] = []
+        S['progress'] = {}
+        S['cancel_flag'] = False
+        S['current_task'] = None
 
 # ── Config Loader ────────────────────────────────────────────────────────────
 CONFIG_FILE = 'config.yaml'
@@ -97,10 +100,12 @@ def events():
     return Response(stream(), mimetype='text/event-stream')
 
 def update_state(new_status=None, **kwargs):
-    if new_status: S['status'] = new_status
-    for k, v in kwargs.items():
-        if k in S: S[k] = v
-    broadcast('state', {k: S[k] for k in S if k != 'current_task'})
+    with state_lock:
+        if new_status: S['status'] = new_status
+        for k, v in kwargs.items():
+            if k in S: S[k] = v
+        snapshot = {k: S[k] for k in S if k != 'current_task'}
+    broadcast('state', snapshot)
 
 def log_to_web(level, message, video_id=None):
     ts = datetime.now().strftime('%H:%M:%S')
@@ -111,7 +116,8 @@ def log_to_web(level, message, video_id=None):
         logger.info(f"[{video_id or 'GLOBAL'}] {message}")
 
 def report_progress(video_id, pct, message):
-    S['progress'][video_id] = {'pct': pct, 'message': message}
+    with state_lock:
+        S['progress'][video_id] = {'pct': pct, 'message': message}
     broadcast('progress', {'id': video_id, 'pct': pct, 'message': message})
 
 # ── Pipeline Core ─────────────────────────────────────────────────────────────
@@ -168,6 +174,42 @@ def run_scan():
                         # Sort formats: combined first, then resolution desc
                         all_formats.sort(key=lambda x: (x['vcodec'] != 'none' and x['acodec'] != 'none', x['resolution']), reverse=True)
 
+                        # Pick recommended format pair:
+                        # Best video: h264 <= 1080p; fallback to any codec <= 1080p
+                        # Best audio: m4a/mp4a; fallback to any audio-only
+                        video_formats = [f for f in all_formats if f['acodec'] == 'none' and f['vcodec'] != 'none']
+                        audio_formats = [f for f in all_formats if f['vcodec'] == 'none' and f['acodec'] != 'none']
+
+                        def res_height(f):
+                            try: return int(f['resolution'].split('x')[1])
+                            except: return 0
+
+                        vid_1080 = [f for f in video_formats if res_height(f) <= 1080]
+                        h264_candidates = [f for f in vid_1080 if 'avc' in f['vcodec']]
+                        best_video = (
+                            sorted(h264_candidates, key=res_height, reverse=True)[0] if h264_candidates else
+                            sorted(vid_1080, key=res_height, reverse=True)[0] if vid_1080 else
+                            None
+                        )
+                        m4a_candidates = [f for f in audio_formats if f['ext'] in ('m4a', 'mp4')]
+                        best_audio = (
+                            sorted(m4a_candidates, key=lambda f: f.get('abr') or 0, reverse=True)[0] if m4a_candidates else
+                            sorted(audio_formats, key=lambda f: f.get('abr') or 0, reverse=True)[0] if audio_formats else
+                            None
+                        )
+
+                        recommended_ids = set()
+                        if best_video: recommended_ids.add(best_video['format_id'])
+                        if best_audio: recommended_ids.add(best_audio['format_id'])
+                        for f in all_formats:
+                            f['recommended'] = f['format_id'] in recommended_ids
+
+                        rec_format_id = None
+                        if best_video and best_audio:
+                            rec_format_id = f"{best_video['format_id']}+{best_audio['format_id']}"
+                        elif best_video:
+                            rec_format_id = best_video['format_id']
+
                         new_candidates.append({
                             'id': e['id'],
                             'title': e['title'],
@@ -175,7 +217,8 @@ def run_scan():
                             'url': f"https://www.youtube.com/watch?v={e['id']}" if 'entries' in info else url,
                             'url_type': 'video',
                             'already_downloaded': False,
-                            'formats': all_formats
+                            'formats': all_formats,
+                            'rec_format_id': rec_format_id
                         })
                 except Exception as e:
                     log_to_web('error', f"源解析失败 {url}: {str(e)}")
@@ -187,7 +230,8 @@ def run_scan():
                 c['already_downloaded'] = True
         
         # Merge with existing candidates (if any)
-        S['candidates'] = new_candidates
+        with state_lock:
+            S['candidates'] = new_candidates
         log_to_web('info', f"扫描完成，发现 {len(new_candidates)} 个候选视频。")
         update_state('scan_done')
     except Exception as e:
@@ -214,9 +258,9 @@ def run_download(video_ids):
             
             log_to_web('info', f"开始下载 [{format_id or quality}]: {c['title']}", vid)
             
-            # Phase 1: Slugified Path Naming
+            # Phase 1: Slugified Path Naming (include video_id to prevent collisions)
             safe_title = slugify(c['title'])
-            vid_dir = os.path.join(work_dir, safe_title)
+            vid_dir = os.path.join(work_dir, f"{safe_title}_{vid[:8]}")
             os.makedirs(vid_dir, exist_ok=True)
             out_tmpl = os.path.join(vid_dir, f"{safe_title}.%(ext)s")
             
@@ -259,40 +303,45 @@ def run_download(video_ids):
                     ydl.download([c['url']])
                 
                 # Phase 3: Flexible Verify and Map
-                # Instead of a fixed filename, scan the directory for the largest MP4/MKV/Video file
+                # First try the expected filename, then fall back to largest video file
                 found_video = None
-                max_size = 0
-                
-                if os.path.exists(vid_dir):
-                    for f in os.listdir(vid_dir):
-                        if f.endswith(('.mp4', '.mkv', '.mov', '.ts', '.flv')):
-                            fpath = os.path.join(vid_dir, f)
-                            fsize = os.path.getsize(fpath)
-                            if fsize > max_size and fsize > 10 * 1024 * 1024: # Must be > 10MB to be a video
-                                max_size = fsize
-                                found_video = fpath
+                expected = os.path.join(vid_dir, f"{safe_title}.mp4")
+                if os.path.exists(expected) and os.path.getsize(expected) > 0:
+                    found_video = expected
+                else:
+                    max_size = 0
+                    if os.path.exists(vid_dir):
+                        for f in os.listdir(vid_dir):
+                            if f.endswith(('.mp4', '.mkv', '.mov', '.ts', '.flv')):
+                                fpath = os.path.join(vid_dir, f)
+                                fsize = os.path.getsize(fpath)
+                                if fsize > max_size and fsize > 1 * 1024 * 1024: # Must be > 1MB
+                                    max_size = fsize
+                                    found_video = fpath
 
                 if found_video:
                     # Store the local path for downstream steps
                     c['local_path'] = found_video
                     c['local_dir'] = vid_dir
-                    
+
                     # Check for thumbnail (might be .jpg, .png, .webp)
                     # Look for any image file in the directory
                     for f in os.listdir(vid_dir):
                         if f.lower().endswith(('.jpg', '.png', '.webp', '.jpeg')):
                             c['original_thumbnail'] = os.path.join(vid_dir, f)
                             break
-                    
-                    S['downloaded'].append(c)
+
+                    with state_lock:
+                        S['downloaded'].append(c)
                     log_to_web('info', f"成功下载并识别: {os.path.basename(found_video)}", vid)
                 else:
-                    raise Exception("下载完成但未找到有效的视频文件(>10MB)")
-                    
+                    raise Exception("下载完成但未找到有效的视频文件(>1MB)")
+
             except Exception as e:
                 # Log error but DO NOT DELETE the directory
                 log_to_web('error', f"下载阶段异常: {str(e)}", vid)
-                S['errors'].append({'id': vid, 'step': 'download', 'message': str(e)})
+                with state_lock:
+                    S['errors'].append({'id': vid, 'step': 'download', 'message': str(e)})
                 log_to_web('error', f"下载失败: {str(e)}", vid)
 
         update_state('download_done')
@@ -314,9 +363,10 @@ def run_transcode():
             
             # Use Slugified Paths
             safe_title = slugify(c['title'])
+            vid_dir_name = f"{safe_title}_{vid[:8]}"
             video_data = {
                 'id': vid,
-                'filepath': os.path.join(cfg['app']['work_dir'], safe_title, f"{safe_title}.mp4")
+                'filepath': os.path.join(cfg['app']['work_dir'], vid_dir_name, f"{safe_title}.mp4")
             }
 
             def transcode_progress(pct):
@@ -327,13 +377,15 @@ def run_transcode():
                 res = processor.process(video_data, cancel_check=check_cancel, progress_cb=transcode_progress)
                 
                 if res:
-                    S['transcoded'].append(c)
+                    with state_lock:
+                        S['transcoded'].append(c)
                     report_progress(vid, 100, "转码完成")
                     log_to_web('info', f"转码成功: {c['title']}", vid)
                 else:
                     raise Exception("计算后端返回失败")
             except Exception as e:
-                S['errors'].append({'id': vid, 'step': 'transcode', 'message': str(e)})
+                with state_lock:
+                    S['errors'].append({'id': vid, 'step': 'transcode', 'message': str(e)})
                 log_to_web('error', f"转码失败: {str(e)}", vid)
 
         update_state('transcode_done')
@@ -353,10 +405,17 @@ def run_upload():
             if S['cancel_flag']: break
             vid = c['id']
             log_to_web('info', f"准备上传至 B站: {c['title']}", vid)
+
+            # Per-video meta override from frontend editor
+            meta = S.get('upload_meta', {}).get(vid, {})
+            upload_title = meta.get('title') or c['title']
+            tid_override = int(meta['tid']) if meta.get('tid') else None
+            tags_raw = meta.get('tags', '')
+            tags_override = [t.strip() for t in tags_raw.split(',') if t.strip()] if tags_raw else None
             
             # Use Slugified Paths
             safe_title = slugify(c['title'])
-            vid_dir = os.path.join(work_dir, safe_title)
+            vid_dir = os.path.join(work_dir, f"{safe_title}_{vid[:8]}")
             file_path = os.path.join(vid_dir, f"{safe_title}_final.mp4")
             
             # Check for original thumbnail (downloaded by yt-dlp)
@@ -372,21 +431,25 @@ def run_upload():
 
             try:
                 res = uploader.upload(
-                    file_path, 
-                    c['title'], 
-                    c['url'], 
-                    original_thumbnail=thumb_path, 
+                    file_path,
+                    upload_title,
+                    c['url'],
+                    original_thumbnail=thumb_path,
                     original_description=c.get('description', ''),
-                    progress_callback=upload_progress
+                    progress_callback=upload_progress,
+                    tid_override=tid_override,
+                    tags_override=tags_override
                 )
                 if res:
-                    S['uploaded'].append(c)
+                    with state_lock:
+                        S['uploaded'].append(c)
                     add_history(vid)
                     log_to_web('info', f"B站上传成功: {c['title']}", vid)
                 else:
                     raise Exception("上传器返回失败状态")
             except Exception as e:
-                S['errors'].append({'id': vid, 'step': 'upload', 'message': str(e)})
+                with state_lock:
+                    S['errors'].append({'id': vid, 'step': 'upload', 'message': str(e)})
                 log_to_web('error', f"上传失败: {str(e)}", vid)
 
         update_state('done')
@@ -403,10 +466,11 @@ def get_history():
     except: return []
 
 def add_history(vid):
-    h = get_history()
-    if vid not in h:
-        h.append(vid)
-        with open(HISTORY_FILE, 'w') as f: json.dump(h, f)
+    with history_lock:
+        h = get_history()
+        if vid not in h:
+            h.append(vid)
+            with open(HISTORY_FILE, 'w') as f: json.dump(h, f)
 
 # ── API Routes ────────────────────────────────────────────────────────────────
 
@@ -420,11 +484,12 @@ def get_status():
 
 @app.route('/api/scan', methods=['POST'])
 def trigger_scan():
-    if S['status'] in ['scanning', 'downloading', 'transcoding', 'uploading']:
-        return jsonify({'error': 'Pipeline busy'}), 400
-    S['cancel_flag'] = False
-    S['current_task'] = threading.Thread(target=run_scan)
-    S['current_task'].start()
+    with state_lock:
+        if S['status'] in ['scanning', 'downloading', 'transcoding', 'uploading']:
+            return jsonify({'error': 'Pipeline busy'}), 400
+        S['cancel_flag'] = False
+        S['current_task'] = threading.Thread(target=run_scan)
+        S['current_task'].start()
     return jsonify({'ok': True})
 
 @app.route('/api/download', methods=['POST'])
@@ -432,27 +497,31 @@ def trigger_download():
     data = request.json or {}
     video_ids = data.get('video_ids', []) # Expected list of {id, quality}
     if not video_ids: return jsonify({'error': 'No IDs provided'}), 400
-    if S['status'] != 'scan_done': return jsonify({'error': 'Wrong state'}), 400
-    
-    S['cancel_flag'] = False
-    S['current_task'] = threading.Thread(target=run_download, args=(video_ids,))
-    S['current_task'].start()
+    with state_lock:
+        if S['status'] != 'scan_done': return jsonify({'error': 'Wrong state'}), 400
+        S['cancel_flag'] = False
+        S['current_task'] = threading.Thread(target=run_download, args=(video_ids,))
+        S['current_task'].start()
     return jsonify({'ok': True})
 
 @app.route('/api/transcode', methods=['POST'])
 def trigger_transcode():
-    if S['status'] != 'download_done': return jsonify({'error': 'Wrong state'}), 400
-    S['cancel_flag'] = False
-    S['current_task'] = threading.Thread(target=run_transcode)
-    S['current_task'].start()
+    with state_lock:
+        if S['status'] != 'download_done': return jsonify({'error': 'Wrong state'}), 400
+        S['cancel_flag'] = False
+        S['current_task'] = threading.Thread(target=run_transcode)
+        S['current_task'].start()
     return jsonify({'ok': True})
 
 @app.route('/api/upload', methods=['POST'])
 def trigger_upload():
-    if S['status'] != 'transcode_done': return jsonify({'error': 'Wrong state'}), 400
-    S['cancel_flag'] = False
-    S['current_task'] = threading.Thread(target=run_upload)
-    S['current_task'].start()
+    data = request.json or {}
+    with state_lock:
+        if S['status'] != 'transcode_done': return jsonify({'error': 'Wrong state'}), 400
+        S['upload_meta'] = data.get('meta', {})
+        S['cancel_flag'] = False
+        S['current_task'] = threading.Thread(target=run_upload)
+        S['current_task'].start()
     return jsonify({'ok': True})
 
 @app.route('/api/reset', methods=['POST'])
@@ -463,7 +532,8 @@ def trigger_reset():
 
 @app.route('/api/cancel', methods=['POST'])
 def trigger_cancel():
-    S['cancel_flag'] = True
+    with state_lock:
+        S['cancel_flag'] = True
     log_to_web('warn', "任务取消请求已发出...")
     return jsonify({'ok': True})
 
@@ -473,12 +543,15 @@ def trigger_retry():
     vid = data.get('video_id')
     if not vid: return jsonify({'error': 'Missing video_id'}), 400
     
-    # Identify the failed step
+    # Identify the failed step — normalize _retry suffix back to base step
     err_entry = next((e for e in S['errors'] if e['id'] == vid), None)
     failed_step = err_entry['step'] if err_entry else 'unknown'
+    # Strip _retry suffix so retries of retries still map correctly
+    failed_step = failed_step.replace('_retry', '')
     
     # Remove from errors
-    S['errors'] = [e for e in S['errors'] if e['id'] != vid]
+    with state_lock:
+        S['errors'] = [e for e in S['errors'] if e['id'] != vid]
     
     video_entry = next((c for c in S['candidates'] if c['id'] == vid), None)
     if not video_entry:
@@ -501,14 +574,16 @@ def trigger_retry():
                 from video_processor import VideoProcessor
                 processor = VideoProcessor(cfg)
                 safe_title = slugify(video_entry['title'])
-                src_path = os.path.join(cfg['app']['work_dir'], safe_title, f"{safe_title}.mp4")
+                src_path = os.path.join(cfg['app']['work_dir'], f"{safe_title}_{vid[:8]}", f"{safe_title}.mp4")
                 v_data = {'id': vid, 'filepath': src_path}
                 def pb(p): report_progress(vid, p, "重试转码中...")
                 if processor.process(v_data, cancel_check=lambda: S['cancel_flag'], progress_cb=pb):
-                    if video_entry not in S['transcoded']: S['transcoded'].append(video_entry)
+                    with state_lock:
+                        if video_entry not in S['transcoded']: S['transcoded'].append(video_entry)
                     report_progress(vid, 100, "转码完成")
-                    # If all now transcoded, allow manual or auto transition
-                    if not S['errors']: update_state('transcode_done')
+                    with state_lock:
+                        has_errors = bool(S['errors'])
+                    if not has_errors: update_state('transcode_done')
                 else: raise Exception("转码逻辑失败")
 
             # 3. Retry UPLOAD
@@ -516,7 +591,7 @@ def trigger_retry():
                 from bili_uploader import BilibiliUploader
                 uploader = BilibiliUploader(cfg)
                 safe_title = slugify(video_entry['title'])
-                vid_dir = os.path.join(cfg['app']['work_dir'], safe_title)
+                vid_dir = os.path.join(cfg['app']['work_dir'], f"{safe_title}_{vid[:8]}")
                 final_mp4 = os.path.join(vid_dir, f"{safe_title}_final.mp4")
                 
                 # Check for thumbnail
@@ -524,22 +599,24 @@ def trigger_retry():
                 for ext in ['jpg', 'png', 'webp', 'jpeg']:
                     tf = os.path.join(vid_dir, f"{safe_title}.{ext}")
                     if os.path.exists(tf): thumb = tf; break
-
                 def up_pb(p, s): report_progress(vid, p, s)
-                if uploader.upload(final_mp4, video_entry['title'], video_entry['url'], 
-                                   original_thumbnail=thumb, 
+                if uploader.upload(final_mp4, video_entry['title'], video_entry['url'],
+                                   original_thumbnail=thumb,
                                    original_description=video_entry.get('description', ''),
                                    progress_callback=up_pb):
-                    if video_entry not in S['uploaded']: S['uploaded'].append(video_entry)
+                    with state_lock:
+                        if video_entry not in S['uploaded']: S['uploaded'].append(video_entry)
                     report_progress(vid, 100, "上传完成")
                     add_history(vid)
-                    # Complete batch if no more errors
-                    if not S['errors']: update_state('done')
+                    with state_lock:
+                        has_errors = bool(S['errors'])
+                    if not has_errors: update_state('done')
                 else: raise Exception("再次投递失败")
             else:
                 log_to_web('warn', f"未知的失败状态 '{failed_step}'，无法自动重试", vid)
         except Exception as e:
-            S['errors'].append({'id': vid, 'step': f"{failed_step}_retry", 'message': str(e)})
+            with state_lock:
+                S['errors'].append({'id': vid, 'step': f"{failed_step}_retry", 'message': str(e)})
             log_to_web('error', f"重试失败: {str(e)}", vid)
             
     threading.Thread(target=retry_worker, daemon=True).start()
@@ -555,6 +632,7 @@ def get_config():
         'tid': cfg['bilibili'].get('tid', 171),
         'intro_path': cfg['ffmpeg'].get('intro_video_path', ''),
         'desc_prefix': cfg['bilibili'].get('desc_prefix', ''),
+        'zhipu_key': cfg.get('zhipu', {}).get('api_key', ''),
     })
 
 @app.route('/api/config', methods=['POST'])
@@ -565,6 +643,9 @@ def set_config():
     if 'tid' in data: cfg['bilibili']['tid'] = int(data['tid'])
     if 'intro_path' in data: cfg['ffmpeg']['intro_video_path'] = data['intro_path']
     if 'desc_prefix' in data: cfg['bilibili']['desc_prefix'] = data['desc_prefix']
+    if 'zhipu_key' in data:
+        if 'zhipu' not in cfg: cfg['zhipu'] = {}
+        cfg['zhipu']['api_key'] = data['zhipu_key']
     save_config(cfg)
     return jsonify({'ok': True})
 

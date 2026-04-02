@@ -12,6 +12,8 @@ const S = {
   progress: {},
   current_video: null,
   selectedFormats: {}, // videoID -> Set of formatIDs
+  uploadMeta: {},      // videoID -> { title, tid, tags }
+  globalTid: 171,
 };
 let selectedIds = new Set();   // for download step checkbox selection
 
@@ -361,12 +363,17 @@ function renderVideoSection() {
     if (showCheckbox && !isSkip && c.formats && c.formats.length) {
         const formatsWrap = document.createElement('div');
         formatsWrap.className = 'video-formats';
-        
+
+        // Auto-preselect recommended formats on first render
+        if (c.rec_format_id && !S.selectedFormats[c.id]) {
+            S.selectedFormats[c.id] = new Set(c.rec_format_id.split('+'));
+        }
+
         c.formats.forEach(f => {
             if (f.is_thumbnail) return; // Skip thumbnails in the UI
             const isSelected = (S.selectedFormats[c.id] || new Set()).has(f.format_id);
             const fmtItem = document.createElement('div');
-            fmtItem.className = 'format-item' + (isSelected ? ' selected' : '');
+            fmtItem.className = 'format-item' + (isSelected ? ' selected' : '') + (f.recommended ? ' recommended' : '');
             fmtItem.dataset.vid = c.id;
             fmtItem.dataset.fid = f.format_id;
             
@@ -383,6 +390,7 @@ function renderVideoSection() {
                     ${isCombo ? '<span class="tag">Combo</span>' : ''}
                     ${isVideo ? '<span class="tag video">Video</span>' : ''}
                     ${isAudio ? '<span class="tag audio">Audio</span>' : ''}
+                    ${f.recommended ? '<span class="tag rec">推荐</span>' : ''}
                 </div>
             `;
             
@@ -405,7 +413,41 @@ function renderVideoSection() {
         });
         row.appendChild(formatsWrap);
     }
-    
+
+    // Upload meta editor (only when waiting for upload)
+    if (status === 'transcode_done' && isTranscoded && !isUploaded) {
+        if (!S.uploadMeta[c.id]) {
+            S.uploadMeta[c.id] = {
+                title: c.title || '',
+                tid: String(S.globalTid),
+                tags: 'YouTube,搬运,AI翻译,中字'
+            };
+        }
+        const m = S.uploadMeta[c.id];
+        const editor = document.createElement('div');
+        editor.className = 'upload-meta-editor';
+        editor.innerHTML = `
+          <div class="meta-field">
+            <label>标题</label>
+            <input type="text" class="meta-title" value="${m.title.replace(/"/g, '&quot;')}">
+          </div>
+          <div class="meta-field">
+            <label>分区</label>
+            <select class="meta-tid">${TID_OPTIONS_HTML}</select>
+          </div>
+          <div class="meta-field">
+            <label>标签 <span style="opacity:.5;font-size:10px">逗号分隔</span></label>
+            <input type="text" class="meta-tags" value="${m.tags}">
+          </div>`;
+        // Set select value after insertion
+        editor.querySelector('.meta-tid').value = m.tid;
+        // Sync changes back to S.uploadMeta
+        editor.querySelector('.meta-title').addEventListener('input', e => { S.uploadMeta[c.id].title = e.target.value; });
+        editor.querySelector('.meta-tid').addEventListener('change', e => { S.uploadMeta[c.id].tid = e.target.value; });
+        editor.querySelector('.meta-tags').addEventListener('input', e => { S.uploadMeta[c.id].tags = e.target.value; });
+        row.appendChild(editor);
+    }
+
     listEl.appendChild(row);
   });
 
@@ -453,17 +495,27 @@ async function doDownload() {
     const selFormats = S.selectedFormats[id];
     let format_id = null;
     if (selFormats && selFormats.size > 0) {
-        // If user picked specific formats, join them with + (yt-dlp syntax)
         format_id = [...selFormats].join('+');
+    } else {
+        // Fallback to server-recommended format
+        const c = S.candidates.find(x => x.id === id);
+        if (c && c.rec_format_id) format_id = c.rec_format_id;
     }
-    
+
     return { id: id, format_id: format_id, quality: 'custom' };
   });
   
   await api('POST', '/api/download', { video_ids: payload });
 }
 async function doTranscode() { await api('POST', '/api/transcode'); }
-async function doUpload()    { await api('POST', '/api/upload'); }
+async function doUpload() {
+  const meta = {};
+  S.transcoded.forEach(c => {
+    const m = S.uploadMeta[c.id];
+    if (m) meta[c.id] = m;
+  });
+  await api('POST', '/api/upload', { meta });
+}
 async function doReset()     { await api('POST', '/api/reset'); }
 async function doRetry(id)     { await api('POST', '/api/retry', { video_id: id }); }
 
@@ -547,11 +599,19 @@ async function loadHistory() {
     </div>`).join('');
 }
 
-// ── Settings tab ──────────────────────────────────────────────────────────────
+// ── Tid options HTML (cloned from settings select, so we only maintain one copy) ──
+function getTidOptionsHTML() {
+  const src = document.getElementById('cfg-tid');
+  if (src) return src.innerHTML;
+  return '<option value="171">171 · 电子竞技</option>';
+}
+let TID_OPTIONS_HTML = '';
+document.addEventListener('DOMContentLoaded', () => { TID_OPTIONS_HTML = getTidOptionsHTML(); });
 async function loadSettings() {
   const cfg = await api('GET', '/api/config');
   if (!cfg) return;
   document.getElementById('cfg-proxy').value = cfg.proxy || '';
+  S.globalTid = cfg.tid || 171;
   // Set the select to match current tid, default to 171
   const tidSel = document.getElementById('cfg-tid');
   tidSel.value = String(cfg.tid || 171);
@@ -559,6 +619,7 @@ async function loadSettings() {
   if (!tidSel.value) tidSel.value = '171';
   document.getElementById('cfg-intro').value = cfg.intro_path || '';
   document.getElementById('cfg-desc').value  = cfg.desc_prefix || '';
+  document.getElementById('cfg-zhipu-key').value = cfg.zhipu_key || '';
 
   const bs = await api('GET', '/api/bilibili/status');
   const dot = document.getElementById('bili-dot');
@@ -581,6 +642,7 @@ document.getElementById('btn-save-config').addEventListener('click', async () =>
     tid:        parseInt(document.getElementById('cfg-tid').value) || 171,
     intro_path: document.getElementById('cfg-intro').value.trim(),
     desc_prefix:document.getElementById('cfg-desc').value,
+    zhipu_key:  document.getElementById('cfg-zhipu-key').value.trim(),
   };
   const res = await api('POST', '/api/config', cfg);
   if (res && res.ok) {

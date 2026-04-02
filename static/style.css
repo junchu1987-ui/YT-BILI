@@ -276,6 +276,30 @@ body {
 }
 .tag.audio { color: var(--yellow); }
 .tag.video { color: var(--green); }
+.tag.rec { color: #fff; background: rgba(91,141,238,.35); font-weight: 600; }
+.format-item.recommended {
+  border-color: var(--accent-dim);
+  background: rgba(91,141,238,.06);
+}
+
+.upload-meta-editor {
+  display: grid;
+  grid-template-columns: 1fr 180px 1fr;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--bg2);
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 8px 8px;
+}
+.meta-field { display: flex; flex-direction: column; gap: 4px; }
+.meta-field label { font-size: 10px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; }
+.meta-field input, .meta-field select {
+  background: var(--bg3); border: 1px solid var(--border); border-radius: 5px;
+  color: var(--text); padding: 5px 8px; font-size: 12px;
+}
+.meta-field input:focus, .meta-field select:focus {
+  outline: none; border-color: var(--accent);
+}
 
 .video-progress { width: 140px; flex-shrink: 0; }
 .badge {

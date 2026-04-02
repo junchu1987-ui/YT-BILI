@@ -38,6 +38,13 @@ class YouTubeDownloader:
             try:
                 with open(self.history_file, 'r', encoding='utf-8') as f:
                     self.history = json.load(f)
+            except json.JSONDecodeError:
+                # Corrupted file — back it up and start fresh rather than silently losing history
+                import shutil
+                backup = self.history_file + '.bak'
+                shutil.copy2(self.history_file, backup)
+                logging.warning(f"history.json is corrupted. Backed up to {backup} and starting fresh.")
+                self.history = []
             except Exception:
                 self.history = []
         else:

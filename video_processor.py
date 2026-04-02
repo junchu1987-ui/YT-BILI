@@ -1,8 +1,10 @@
 import os
+import re
 import subprocess
 import logging
 import json
 import shutil
+from fractions import Fraction
 
 class VideoProcessor:
     def __init__(self, config):
@@ -45,7 +47,11 @@ class VideoProcessor:
 
     def _get_video_info(self, filepath):
         """Uses ffprobe to extract exhaustive metadata for cloning."""
-        ffprobe_path = self.ffmpeg_path.replace('ffmpeg', 'ffprobe')
+        # Build ffprobe path by replacing only the filename, not path substrings
+        ffmpeg_dir = os.path.dirname(os.path.abspath(self.ffmpeg_path))
+        ffmpeg_basename = os.path.basename(self.ffmpeg_path)
+        ffprobe_basename = re.sub(r'(?i)ffmpeg', 'ffprobe', ffmpeg_basename)
+        ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_basename) if ffmpeg_dir else ffprobe_basename
         cmd = [
             ffprobe_path, '-v', 'error',
             '-show_entries', 'stream=codec_type,codec_name,width,height,pix_fmt,r_frame_rate,sample_rate,channels,bit_rate:format=duration',
@@ -71,9 +77,9 @@ class VideoProcessor:
                 'pix_fmt': v_stream.get('pix_fmt'),
                 'fps': v_stream.get('r_frame_rate'),
                 'a_codec': a_codec,
-                'a_rate': a_stream.get('sample_rate'),
-                'a_channels': a_stream.get('channels'),
-                'a_bitrate': a_stream.get('bit_rate', '128k'),
+                'a_rate': a_stream.get('sample_rate') or '44100',
+                'a_channels': a_stream.get('channels') or 2,
+                'a_bitrate': a_stream.get('bit_rate') or '128000',
                 'duration_us': int(duration * 1000000)
             }
         except Exception as e:
@@ -142,28 +148,41 @@ class VideoProcessor:
         if not m: return None
         
         # Step 2: Transcode Intro to EXACTLY match the Main Video's Format
-        v_enc = self.encoders.get('h264', 'libx264')
-        # Precise hash for the matching intro
-        m_hash = f"{m['width']}x{m['height']}_{m['v_codec']}_{m['a_codec']}_{m['a_rate']}_{m['a_channels']}"
+        v_enc = self.encoders.get('h264') or 'libx264'
+
+        # Resolve audio bitrate from probe (ffprobe returns bits/s as string e.g. "128000")
+        raw_br = m.get('a_bitrate', '192k')
+        try:
+            a_bitrate = f"{int(raw_br) // 1000}k"
+        except (ValueError, TypeError):
+            a_bitrate = str(raw_br) if raw_br else '192k'
+        # Precise hash for the matching intro — fps must be included to avoid reusing wrong cache
+        try:
+            fps_val = float(Fraction(m['fps'])) if m.get('fps') else 30.0
+        except (ValueError, ZeroDivisionError):
+            fps_val = 30.0
+        m_hash = f"{m['width']}x{m['height']}_{fps_val:.3f}_{m['v_codec']}_{m['a_codec']}_{m['a_rate']}_{m['a_channels']}"
         cache_key = f"intro_match_{m_hash}.mp4"
         matched_intro = os.path.join(self.work_dir, cache_key)
-        
+
         if not os.path.exists(matched_intro):
-            logging.info(f"GPU Pre-aligner: Matching intro to {m['width']}x{m['height']} @ {m['fps']}fps")
-            
-            # Match resolution, fps, pix_fmt, and basic audio params
+            logging.info(f"GPU Pre-aligner: Matching intro to {m['width']}x{m['height']} @ {fps_val:.3f}fps")
+
+            if 'qsv' in v_enc:
+                vf_str = f"scale={m['width']}:{m['height']}:force_original_aspect_ratio=decrease,pad={m['width']}:{m['height']}:(ow-iw)/2:(oh-ih)/2,format=nv12"
+            else:
+                vf_str = f"scale={m['width']}:{m['height']}:force_original_aspect_ratio=decrease,pad={m['width']}:{m['height']}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+
             cmd_intro = [
                 self.ffmpeg_path, '-y',
                 '-i', self.intro_path,
-                '-vf', f"scale={m['width']}:{m['height']}:force_original_aspect_ratio=decrease,pad={m['width']}:{m['height']}:(ow-iw)/2:(oh-ih)/2,format=nv12",
-                '-r', str(m['fps']),
-                '-c:v', v_enc, '-global_quality', '18', # High quality for alignment
+                '-vf', vf_str,
+                '-r', f"{fps_val:.3f}",
+                '-c:v', v_enc, '-global_quality', '18',
             ]
-            if 'qsv' in v_enc:
-                cmd_intro += ['-pix_fmt', 'nv12']
             
             cmd_intro += [
-                '-c:a', 'aac', '-ar', str(m['a_rate']), '-ac', str(m['a_channels']), '-b:a', '192k',
+                '-c:a', 'aac', '-ar', str(m['a_rate']), '-ac', str(m['a_channels']), '-b:a', a_bitrate,
                 matched_intro
             ]
             try:
@@ -172,52 +191,48 @@ class VideoProcessor:
                 logging.error(f"High-precision alignment failed: {e}")
                 return None
 
-        # Step 3: Seamless Merger (Robust GPU Transcode)
-        # Since resolutions are already matched, we use the SIMPLEST possible filter_complex.
-        # This fixes the "Audio Noise" issue by fully re-encoding the concatenated stream.
-        logging.info("Seamless merging using simple GPU-compatible filter chain...")
-        
-        # Simple concat filter: already matched resolution avoids QSV-filter-complex bugs
-        filter_str = "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]"
-        if 'qsv' in v_enc:
-            # For QSV, ensure the concat output is explicitly nv12 before encoding
-            filter_str += "; [v]format=nv12[outv]"
-        else:
-            filter_str += "; [v]format=yuv420p[outv]"
+        # Step 3: Seamless Merger via filter_complex
+        # CPU decode (stable) + QSV encode. h264_qsv accepts yuv420p frames directly.
+        logging.info("Seamless merging using filter_complex + h264_qsv...")
 
-        cmd_merge = [
-            self.ffmpeg_path, '-y',
-            '-i', matched_intro,
-            '-i', filepath,
-            '-filter_complex', filter_str,
-            '-map', '[outv]', '-map', '[a]',
-            '-c:v', v_enc,
-        ]
-        
         if 'qsv' in v_enc:
-            cmd_merge += ['-global_quality', '25', '-pix_fmt', 'nv12']
+            filter_str = "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]"
+            cmd_merge = [
+                self.ffmpeg_path, '-y',
+                '-i', matched_intro,
+                '-i', filepath,
+                '-filter_complex', filter_str,
+                '-map', '[outv]', '-map', '[outa]',
+                '-c:v', v_enc, '-global_quality', '25',
+                '-c:a', 'aac', '-b:a', a_bitrate,
+                final_output
+            ]
         else:
-            cmd_merge += ['-preset', 'medium', '-crf', '23']
+            filter_str = "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]"
+            cmd_merge = [
+                self.ffmpeg_path, '-y',
+                '-i', matched_intro,
+                '-i', filepath,
+                '-filter_complex', filter_str,
+                '-map', '[outv]', '-map', '[outa]',
+                '-c:v', v_enc, '-preset', 'medium', '-crf', '23',
+                '-c:a', 'aac', '-b:a', a_bitrate,
+                final_output
+            ]
 
-        cmd_merge += [
-            '-c:a', 'aac', '-b:a', '192k',
-            final_output
-        ]
-        
         try:
             self._run_proc(cmd_merge, cancel_check, progress_cb, m['duration_us'])
             return final_output
         except Exception as e:
-            logging.error(f"Seamless GPU merge failed: {e}. One-time fallback to CPU...")
-            # Fallback only if GPU fails even with simple commands
+            logging.error(f"GPU merge failed: {e}. Falling back to libx264...")
             cmd_fb = [
                 self.ffmpeg_path, '-y',
                 '-i', matched_intro,
                 '-i', filepath,
-                '-filter_complex', "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[v][a]",
-                '-map', '[v]', '-map', '[a]',
+                '-filter_complex', "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+                '-map', '[outv]', '-map', '[outa]',
                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
-                '-c:a', 'aac', '-b:a', '192k',
+                '-c:a', 'aac', '-b:a', a_bitrate,
                 final_output
             ]
             self._run_proc(cmd_fb, cancel_check, progress_cb, m['duration_us'])
