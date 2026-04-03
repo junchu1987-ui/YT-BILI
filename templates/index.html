@@ -293,6 +293,15 @@
         <textarea id="cfg-desc" rows="3" placeholder="本视频搬运自YouTube..."></textarea>
       </div>
       <div class="form-group">
+        <label>默认标签</label>
+        <div id="cfg-tags-wrap" class="tag-input-wrap"></div>
+        <div class="tag-add-row">
+          <input type="text" id="cfg-tag-input" placeholder="输入标签后按 Enter 添加" maxlength="30">
+          <button type="button" class="btn-tag-add" id="btn-tag-add">添加</button>
+        </div>
+        <span class="form-hint">上传时作为默认标签，可在每个视频里单独增删</span>
+      </div>
+      <div class="form-group">
         <label>智谱 GLM API Key</label>
         <input type="password" id="cfg-zhipu-key" placeholder="xxxxxxxx.xxxxxxxx">
         <span class="form-hint">用于标题翻译、简介翻译、封面文字生成（<a href="https://bigmodel.cn" target="_blank">bigmodel.cn</a> 免费注册）</span>

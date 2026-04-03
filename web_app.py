@@ -76,6 +76,18 @@ def save_config(cfg):
     with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
         yaml.dump(cfg, f, allow_unicode=True, sort_keys=False)
 
+def _js_runtimes():
+    """Return js_runtimes dict for yt-dlp if bun is available, else None."""
+    candidates = [
+        os.path.join(os.path.expanduser('~'), '.bun', 'bin', 'bun.exe'),
+        os.path.join(os.path.expanduser('~'), '.bun', 'bin', 'bun'),
+        'bun',
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return {'bun': {'path': p}}
+    return None
+
 # ── SSE Event Hub ────────────────────────────────────────────────────────────
 clients = []
 
@@ -141,7 +153,8 @@ def run_scan():
                 'quiet': True,
                 'no_warnings': True,
                 'extract_flat': False, # Fetch full info for filesize data
-                'proxy': cfg['app'].get('proxy')
+                'proxy': cfg['app'].get('proxy'),
+                'js_runtimes': _js_runtimes(),
             }
             with YoutubeDL(ydl_opts) as ydl:
                 try:
@@ -295,7 +308,8 @@ def run_download(video_ids):
                 'no_warnings': True,
                 'merge_output_format': 'mp4',
                 'writethumbnail': True,
-                'ffmpeg_location': cfg['ffmpeg'].get('bin_path')
+                'ffmpeg_location': cfg['ffmpeg'].get('bin_path'),
+                'js_runtimes': _js_runtimes(),
             }
 
             try:
@@ -354,7 +368,9 @@ def run_transcode():
         update_state('transcoding')
         cfg = load_config()
         from video_processor import VideoProcessor
+        from cover_processor import CoverProcessor
         processor = VideoProcessor(cfg)
+        cover_proc = CoverProcessor(cfg)
 
         for c in S['downloaded']:
             if S['cancel_flag']: break
@@ -377,6 +393,13 @@ def run_transcode():
                 res = processor.process(video_data, cancel_check=check_cancel, progress_cb=transcode_progress)
                 
                 if res:
+                    log_to_web('info', f"转码成功，翻译标题中: {c['title']}", vid)
+                    try:
+                        translated = cover_proc.translate_title(c['title'])
+                        if translated:
+                            c['translated_title'] = translated
+                    except Exception as te:
+                        log_to_web('warn', f"标题翻译失败，将在上传时重试: {te}", vid)
                     with state_lock:
                         S['transcoded'].append(c)
                     report_progress(vid, 100, "转码完成")
@@ -408,10 +431,23 @@ def run_upload():
 
             # Per-video meta override from frontend editor
             meta = S.get('upload_meta', {}).get(vid, {})
-            upload_title = meta.get('title') or c['title']
+            upload_title = meta.get('title') or c.get('translated_title') or c['title']
             tid_override = int(meta['tid']) if meta.get('tid') else None
-            tags_raw = meta.get('tags', '')
-            tags_override = [t.strip() for t in tags_raw.split(',') if t.strip()] if tags_raw else None
+            tags_raw = meta.get('tags', [])
+            if isinstance(tags_raw, list):
+                tags_override = [t.strip() for t in tags_raw if str(t).strip()] or None
+            else:
+                tags_override = [t.strip() for t in str(tags_raw).split(',') if t.strip()] or None
+            dtime_override = None
+            schedule_time_str = meta.get('schedule_time')
+            if schedule_time_str:
+                try:
+                    dt = datetime.fromisoformat(schedule_time_str)
+                    dtime_override = int(dt.timestamp())
+                except Exception as e:
+                    log_to_web('warn', f"无法解析定时时间 '{schedule_time_str}': {e}", vid)
+            copyright_override = int(meta['copyright']) if meta.get('copyright') in (1, 2, '1', '2') else None
+            source_override = meta.get('source') or None
             
             # Use Slugified Paths
             safe_title = slugify(c['title'])
@@ -438,7 +474,11 @@ def run_upload():
                     original_description=c.get('description', ''),
                     progress_callback=upload_progress,
                     tid_override=tid_override,
-                    tags_override=tags_override
+                    tags_override=tags_override,
+                    dtime_override=dtime_override,
+                    title_already_translated='translated_title' in c,
+                    copyright_override=copyright_override,
+                    source_override=source_override
                 )
                 if res:
                     with state_lock:
@@ -633,6 +673,7 @@ def get_config():
         'intro_path': cfg['ffmpeg'].get('intro_video_path', ''),
         'desc_prefix': cfg['bilibili'].get('desc_prefix', ''),
         'zhipu_key': cfg.get('zhipu', {}).get('api_key', ''),
+        'default_tags': cfg['bilibili'].get('default_tags', []),
     })
 
 @app.route('/api/config', methods=['POST'])
@@ -646,6 +687,8 @@ def set_config():
     if 'zhipu_key' in data:
         if 'zhipu' not in cfg: cfg['zhipu'] = {}
         cfg['zhipu']['api_key'] = data['zhipu_key']
+    if 'default_tags' in data:
+        cfg['bilibili']['default_tags'] = [t.strip() for t in data['default_tags'] if t.strip()]
     save_config(cfg)
     return jsonify({'ok': True})
 
@@ -671,7 +714,7 @@ def add_source():
     title = url
     try:
         from yt_dlp import YoutubeDL
-        with YoutubeDL({'quiet':True, 'extract_flat':True, 'proxy':cfg['app'].get('proxy')}) as ydl:
+        with YoutubeDL({'quiet':True, 'extract_flat':True, 'proxy':cfg['app'].get('proxy'), 'js_runtimes':_js_runtimes()}) as ydl:
             info = ydl.extract_info(url, download=False)
             title = info.get('title', url)
     except: pass

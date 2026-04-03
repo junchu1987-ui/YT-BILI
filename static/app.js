@@ -12,8 +12,9 @@ const S = {
   progress: {},
   current_video: null,
   selectedFormats: {}, // videoID -> Set of formatIDs
-  uploadMeta: {},      // videoID -> { title, tid, tags }
+  uploadMeta: {},      // videoID -> { title, tid, tags: [] }
   globalTid: 171,
+  defaultTags: [],
 };
 let selectedIds = new Set();   // for download step checkbox selection
 
@@ -339,17 +340,50 @@ function renderVideoSection() {
         metaExtra += `<span class="video-filesize">${(c.filesize/1024/1024).toFixed(1)} MB</span>`;
     }
 
+    const isDraggable = status === 'transcode_done' && isTranscoded && !isUploaded;
+
     const row = document.createElement('div');
-    row.className = 'video-item-container';
+    row.className = 'video-item-container' + (isDraggable ? ' draggable' : '');
     row.id = 'vic-' + c.id;
-    
+    row.dataset.id = c.id;
+    if (isDraggable) {
+        row.draggable = true;
+        row.addEventListener('dragstart', e => {
+            e.dataTransfer.effectAllowed = 'move';
+            e.dataTransfer.setData('text/plain', c.id);
+            row.classList.add('dragging');
+        });
+        row.addEventListener('dragend', () => row.classList.remove('dragging'));
+        row.addEventListener('dragover', e => {
+            e.preventDefault();
+            e.dataTransfer.dropEffect = 'move';
+            const dragging = listEl.querySelector('.dragging');
+            if (dragging && dragging !== row) {
+                const rect = row.getBoundingClientRect();
+                const mid = rect.top + rect.height / 2;
+                if (e.clientY < mid) listEl.insertBefore(dragging, row);
+                else listEl.insertBefore(dragging, row.nextSibling);
+            }
+        });
+        row.addEventListener('drop', e => {
+            e.preventDefault();
+            // Sync S.transcoded order to DOM order
+            const newOrder = [...listEl.querySelectorAll('.video-item-container[data-id]')]
+                .map(el => el.dataset.id);
+            S.transcoded.sort((a, b) => newOrder.indexOf(a.id) - newOrder.indexOf(b.id));
+        });
+    }
+
     // Video Item Row
     const itemRow = document.createElement('div');
     itemRow.className = 'video-item' + (isSkip ? ' skipped' : '') + (errEntry ? ' error' : '') + (isUploaded ? ' done' : '');
     itemRow.id = 'vi-' + c.id;
-    
+
+    const thumbUrl = `https://i.ytimg.com/vi/${c.id}/mqdefault.jpg`;
     itemRow.innerHTML = `
+      ${isDraggable ? '<div class="drag-handle">⠿</div>' : ''}
       ${chk}
+      <img class="video-thumb" src="${thumbUrl}" alt="" loading="lazy">
       <div class="video-info">
         <div class="video-title" title="${escHtml(c.title)}">${escHtml(c.title)}</div>
         <div class="video-meta">${c.id} · ${labelType(c.url_type)}</div>
@@ -418,12 +452,29 @@ function renderVideoSection() {
     if (status === 'transcode_done' && isTranscoded && !isUploaded) {
         if (!S.uploadMeta[c.id]) {
             S.uploadMeta[c.id] = {
-                title: c.title || '',
+                title: c.translated_title || c.title || '',
                 tid: String(S.globalTid),
-                tags: 'YouTube,搬运,AI翻译,中字'
+                tags: [...S.defaultTags],
+                schedule_time: null,
+                copyright: 1,
+                source: c.url || ''
             };
         }
+        // Ensure tags is always an array
+        if (!Array.isArray(S.uploadMeta[c.id].tags)) {
+            S.uploadMeta[c.id].tags = S.uploadMeta[c.id].tags
+                ? String(S.uploadMeta[c.id].tags).split(',').map(t => t.trim()).filter(Boolean)
+                : [...S.defaultTags];
+        }
         const m = S.uploadMeta[c.id];
+        // Default datetime for scheduled publish: now + 5 hours (biliup requires >4h)
+        const defaultDt = new Date(Date.now() + 5 * 3600 * 1000);
+        const defaultDtLocal = new Date(defaultDt - defaultDt.getTimezoneOffset() * 60000)
+            .toISOString().slice(0, 16);
+        const minDt = new Date(Date.now() + 4 * 3600 * 1000 + 60000);
+        const minDtLocal = new Date(minDt - minDt.getTimezoneOffset() * 60000)
+            .toISOString().slice(0, 16);
+        const isScheduled = !!m.schedule_time;
         const editor = document.createElement('div');
         editor.className = 'upload-meta-editor';
         editor.innerHTML = `
@@ -435,16 +486,99 @@ function renderVideoSection() {
             <label>分区</label>
             <select class="meta-tid">${TID_OPTIONS_HTML}</select>
           </div>
-          <div class="meta-field">
-            <label>标签 <span style="opacity:.5;font-size:10px">逗号分隔</span></label>
-            <input type="text" class="meta-tags" value="${m.tags}">
+          <div class="meta-field full-row">
+            <label>标签</label>
+            <div class="tag-input-wrap meta-tags-wrap"></div>
+            <div class="tag-add-row">
+              <input type="text" class="meta-tag-input" placeholder="输入后按 Enter 添加" maxlength="30">
+              <button type="button" class="btn-tag-add">添加</button>
+            </div>
+          </div>
+          <div class="meta-field full-row">
+            <label>版权</label>
+            <div class="schedule-row">
+              <label class="radio-inline">
+                <input type="radio" name="cr-${c.id}" value="1" ${m.copyright === 2 ? '' : 'checked'}> 自制
+              </label>
+              <label class="radio-inline">
+                <input type="radio" name="cr-${c.id}" value="2" ${m.copyright === 2 ? 'checked' : ''}> 转载
+              </label>
+              <input type="text" class="meta-source" placeholder="转载来源 URL"
+                     value="${escHtml(m.source || '')}"
+                     style="${m.copyright === 2 ? '' : 'display:none'}">
+            </div>
+          </div>
+          <div class="meta-field full-row">
+            <label>发布</label>
+            <div class="schedule-row">
+              <label class="radio-inline">
+                <input type="radio" name="sched-${c.id}" value="now" ${isScheduled ? '' : 'checked'}> 立即发布
+              </label>
+              <label class="radio-inline">
+                <input type="radio" name="sched-${c.id}" value="scheduled" ${isScheduled ? 'checked' : ''}> 定时发布
+              </label>
+              <div class="schedule-dt-wrap" style="${isScheduled ? '' : 'display:none'}">
+                <input type="datetime-local" class="meta-schedule-dt"
+                       value="${m.schedule_time ? m.schedule_time.slice(0,16) : defaultDtLocal}"
+                       min="${minDtLocal}">
+                <span class="schedule-hint">⚠ 需距现在4小时以上</span>
+              </div>
+            </div>
           </div>`;
         // Set select value after insertion
         editor.querySelector('.meta-tid').value = m.tid;
-        // Sync changes back to S.uploadMeta
+        // Render tag chips
+        function renderMetaTags() {
+            const wrap = editor.querySelector('.meta-tags-wrap');
+            wrap.innerHTML = m.tags.map((t, i) => `
+                <span class="tag-chip">${escHtml(t)}<button type="button" class="tag-chip-del" data-i="${i}">×</button></span>
+            `).join('');
+            wrap.querySelectorAll('.tag-chip-del').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    m.tags.splice(Number(btn.dataset.i), 1);
+                    renderMetaTags();
+                });
+            });
+        }
+        renderMetaTags();
+        // Add tag on button click or Enter
+        const tagInput = editor.querySelector('.meta-tag-input');
+        const addTag = () => {
+            const val = tagInput.value.trim();
+            if (val && !m.tags.includes(val)) { m.tags.push(val); renderMetaTags(); }
+            tagInput.value = '';
+        };
+        editor.querySelector('.btn-tag-add').addEventListener('click', addTag);
+        tagInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } });
+        // Sync other fields
         editor.querySelector('.meta-title').addEventListener('input', e => { S.uploadMeta[c.id].title = e.target.value; });
         editor.querySelector('.meta-tid').addEventListener('change', e => { S.uploadMeta[c.id].tid = e.target.value; });
-        editor.querySelector('.meta-tags').addEventListener('input', e => { S.uploadMeta[c.id].tags = e.target.value; });
+        // Copyright radio toggle
+        editor.querySelectorAll(`input[name="cr-${c.id}"]`).forEach(radio => {
+            radio.addEventListener('change', () => {
+                const sourceInput = editor.querySelector('.meta-source');
+                S.uploadMeta[c.id].copyright = Number(radio.value);
+                sourceInput.style.display = radio.value === '2' ? '' : 'none';
+            });
+        });
+        editor.querySelector('.meta-source').addEventListener('input', e => { S.uploadMeta[c.id].source = e.target.value; });
+        // Schedule radio toggle
+        editor.querySelectorAll(`input[name="sched-${c.id}"]`).forEach(radio => {
+            radio.addEventListener('change', () => {
+                const dtWrap = editor.querySelector('.schedule-dt-wrap');
+                if (radio.value === 'scheduled') {
+                    dtWrap.style.display = '';
+                    const dtInput = editor.querySelector('.meta-schedule-dt');
+                    S.uploadMeta[c.id].schedule_time = dtInput.value || defaultDtLocal;
+                } else {
+                    dtWrap.style.display = 'none';
+                    S.uploadMeta[c.id].schedule_time = null;
+                }
+            });
+        });
+        editor.querySelector('.meta-schedule-dt').addEventListener('change', e => {
+            S.uploadMeta[c.id].schedule_time = e.target.value || null;
+        });
         row.appendChild(editor);
     }
 
@@ -607,6 +741,39 @@ function getTidOptionsHTML() {
 }
 let TID_OPTIONS_HTML = '';
 document.addEventListener('DOMContentLoaded', () => { TID_OPTIONS_HTML = getTidOptionsHTML(); });
+
+// ── Tag chip helpers ──────────────────────────────────────────────────────────
+function renderCfgTags(tags) {
+  const wrap = document.getElementById('cfg-tags-wrap');
+  if (!wrap) return;
+  wrap.innerHTML = tags.map((t, i) => `
+    <span class="tag-chip">${escHtml(t)}<button type="button" class="tag-chip-del" data-i="${i}">×</button></span>
+  `).join('');
+  wrap.querySelectorAll('.tag-chip-del').forEach(btn => {
+    btn.addEventListener('click', () => {
+      S.defaultTags.splice(Number(btn.dataset.i), 1);
+      renderCfgTags(S.defaultTags);
+    });
+  });
+}
+
+function addCfgTag() {
+  const input = document.getElementById('cfg-tag-input');
+  const val = input.value.trim();
+  if (!val) return;
+  if (!S.defaultTags.includes(val)) {
+    S.defaultTags.push(val);
+    renderCfgTags(S.defaultTags);
+  }
+  input.value = '';
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('btn-tag-add').addEventListener('click', addCfgTag);
+  document.getElementById('cfg-tag-input').addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); addCfgTag(); }
+  });
+});
 async function loadSettings() {
   const cfg = await api('GET', '/api/config');
   if (!cfg) return;
@@ -620,6 +787,8 @@ async function loadSettings() {
   document.getElementById('cfg-intro').value = cfg.intro_path || '';
   document.getElementById('cfg-desc').value  = cfg.desc_prefix || '';
   document.getElementById('cfg-zhipu-key').value = cfg.zhipu_key || '';
+  S.defaultTags = cfg.default_tags || ['YouTube', '搬运', 'AI翻译', '中字'];
+  renderCfgTags(S.defaultTags);
 
   const bs = await api('GET', '/api/bilibili/status');
   const dot = document.getElementById('bili-dot');
@@ -638,11 +807,12 @@ async function loadSettings() {
 
 document.getElementById('btn-save-config').addEventListener('click', async () => {
   const cfg = {
-    proxy:      document.getElementById('cfg-proxy').value.trim(),
-    tid:        parseInt(document.getElementById('cfg-tid').value) || 171,
-    intro_path: document.getElementById('cfg-intro').value.trim(),
-    desc_prefix:document.getElementById('cfg-desc').value,
-    zhipu_key:  document.getElementById('cfg-zhipu-key').value.trim(),
+    proxy:        document.getElementById('cfg-proxy').value.trim(),
+    tid:          parseInt(document.getElementById('cfg-tid').value) || 171,
+    intro_path:   document.getElementById('cfg-intro').value.trim(),
+    desc_prefix:  document.getElementById('cfg-desc').value,
+    zhipu_key:    document.getElementById('cfg-zhipu-key').value.trim(),
+    default_tags: S.defaultTags,
   };
   const res = await api('POST', '/api/config', cfg);
   if (res && res.ok) {

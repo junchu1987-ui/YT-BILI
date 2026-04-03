@@ -58,7 +58,6 @@ class CoverProcessor:
                 return clean[:6]
             return clean if len(clean) >= 2 else "精品推荐"
 
-        # If title has no Chinese, translate it first
         has_chinese = any('\u4e00' <= c <= '\u9fa5' for c in title_cn)
         input_title = title_cn if has_chinese else self.translate_title(title_cn)
 
@@ -74,7 +73,7 @@ class CoverProcessor:
 
         if result:
             chinese_only = "".join(c for c in result if '\u4e00' <= c <= '\u9fa5')
-            if len(chinese_only) >= 2:
+            if len(chinese_only) >= 3:
                 return chinese_only[:6]
 
         logger.warning(f"GLM summary insufficient, using fallback for: {input_title}")

@@ -31,7 +31,7 @@ class BilibiliUploader:
                 return p
         return 'biliup' # assume in PATH
 
-    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None):
+    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None):
         """
         Uploads a video to Bilibili using the biliup CLI.
         Features: AI-Translation, Robust Retry, Automated Cover.
@@ -43,8 +43,11 @@ class BilibiliUploader:
         bili_title = title
         bili_desc = ""
         try:
-            logger.info(f"Translating meta (title & description)...")
-            bili_title = self.cover_proc.translate_title(title)
+            if title_already_translated:
+                logger.info(f"Title already translated, skipping: {title}")
+            else:
+                logger.info(f"Translating meta (title & description)...")
+                bili_title = self.cover_proc.translate_title(title)
             if original_description:
                 bili_desc = self.cover_proc.translate_description(original_description)
             logger.info(f"Final Bilibili Title: {bili_title}")
@@ -59,7 +62,7 @@ class BilibiliUploader:
         if original_thumbnail and os.path.exists(original_thumbnail):
             try:
                 # Use translated title for summary if possible
-                summary_text = self.cover_proc.get_summary(bili_title)
+                summary_text = self.cover_proc.get_summary(bili_title, description=original_description)
                 cover_path = os.path.abspath(os.path.join(os.path.dirname(file_path), "cover_custom.jpg"))
                 if self.cover_proc.generate_cover(original_thumbnail, summary_text, cover_path):
                     logger.info(f"Custom cover generated: {cover_path}")
@@ -74,20 +77,26 @@ class BilibiliUploader:
 
         # Combine translated description with original link and prefix
         final_description = f"{bili_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
-        tags = tags_override if tags_override is not None else ["YouTube", "Automated", "搬运", "AI翻译", "中字"]
+        tags = tags_override if tags_override is not None else []
 
         # Step 3: Upload Command
+        copyright_val = copyright_override if copyright_override in (1, 2) else 1
         cmd = [
             self.biliup_path, 'upload', file_path,
             '--title', bili_title,
             '--tid', str(tid),
             '--tag', ','.join(tags),
             '--desc', final_description,
-            '--copyright', '1'
+            '--copyright', str(copyright_val)
         ]
+        if copyright_val == 2:
+            cmd += ['--source', source_override or source_url]
         
         if cover_path and os.path.exists(cover_path):
             cmd += ['--cover', cover_path]
+
+        if dtime_override:
+            cmd += ['--dtime', str(dtime_override)]
 
         # Step 3: Retry Loop (3x)
         max_retries = 3

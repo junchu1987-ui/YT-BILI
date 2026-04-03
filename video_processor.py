@@ -168,10 +168,7 @@ class VideoProcessor:
         if not os.path.exists(matched_intro):
             logging.info(f"GPU Pre-aligner: Matching intro to {m['width']}x{m['height']} @ {fps_val:.3f}fps")
 
-            if 'qsv' in v_enc:
-                vf_str = f"scale={m['width']}:{m['height']}:force_original_aspect_ratio=decrease,pad={m['width']}:{m['height']}:(ow-iw)/2:(oh-ih)/2,format=nv12"
-            else:
-                vf_str = f"scale={m['width']}:{m['height']}:force_original_aspect_ratio=decrease,pad={m['width']}:{m['height']}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+            vf_str = f"scale={m['width']}:{m['height']}:force_original_aspect_ratio=decrease,pad={m['width']}:{m['height']}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
 
             cmd_intro = [
                 self.ffmpeg_path, '-y',
@@ -192,30 +189,32 @@ class VideoProcessor:
                 return None
 
         # Step 3: Seamless Merger via filter_complex
-        # CPU decode (stable) + QSV encode. h264_qsv accepts yuv420p frames directly.
-        logging.info("Seamless merging using filter_complex + h264_qsv...")
+        # QSV needs explicit -r because filter_complex concat doesn't propagate fps metadata,
+        # causing h264_qsv encoder init to fail with "Function not implemented" (-40).
+        use_qsv = 'qsv' in v_enc
+        merge_enc = v_enc if use_qsv else v_enc
+        logging.info(f"Merging with {merge_enc} (fps={fps_val:.3f})")
 
-        if 'qsv' in v_enc:
-            filter_str = "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]"
+        filter_str = "[0:v]format=yuv420p[v0];[1:v]format=yuv420p[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]"
+        fps_frac = m['fps']  # e.g. "60000/1001" or "30/1"
+        if use_qsv:
             cmd_merge = [
                 self.ffmpeg_path, '-y',
-                '-i', matched_intro,
-                '-i', filepath,
+                '-i', matched_intro, '-i', filepath,
                 '-filter_complex', filter_str,
                 '-map', '[outv]', '-map', '[outa]',
-                '-c:v', v_enc, '-global_quality', '25',
+                '-r', fps_frac,
+                '-c:v', merge_enc, '-global_quality', '25',
                 '-c:a', 'aac', '-b:a', a_bitrate,
                 final_output
             ]
         else:
-            filter_str = "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]"
             cmd_merge = [
                 self.ffmpeg_path, '-y',
-                '-i', matched_intro,
-                '-i', filepath,
+                '-i', matched_intro, '-i', filepath,
                 '-filter_complex', filter_str,
                 '-map', '[outv]', '-map', '[outa]',
-                '-c:v', v_enc, '-preset', 'medium', '-crf', '23',
+                '-c:v', merge_enc, '-preset', 'medium', '-crf', '23',
                 '-c:a', 'aac', '-b:a', a_bitrate,
                 final_output
             ]
