@@ -2,7 +2,6 @@ import os
 import re
 import json
 import logging
-import subprocess
 import time
 from datetime import datetime
 from cover_processor import CoverProcessor
@@ -12,29 +11,12 @@ logger = logging.getLogger(__name__)
 class BilibiliUploader:
     def __init__(self, config):
         self.config = config
-        self.biliup_path = self._find_biliup()
         self.cookie_file = 'cookies.json'
         self.cover_proc = CoverProcessor(config)
 
-    def _find_biliup(self):
-        # Look in current dir, .venv, or PATH
-        candidates = [
-            'biliup.exe',
-            os.path.join('.venv', 'Scripts', 'biliup.exe'),
-            os.path.join('.venv', 'bin', 'biliup'), # Linux
-            'biliup'
-        ]
-        for c in candidates:
-            if os.path.exists(c):
-                p = os.path.abspath(c)
-                logger.info(f"Using biliup binary at: {p}")
-                return p
-        return 'biliup' # assume in PATH
-
     def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None):
         """
-        Uploads a video to Bilibili using the biliup CLI.
-        Features: AI-Translation, Robust Retry, Automated Cover.
+        Uploads a video to Bilibili using biliup's internal Python API (no CLI).
         """
         if not os.path.exists(self.cookie_file):
             raise Exception("cookies.json not found. Please login via biliup first.")
@@ -61,98 +43,102 @@ class BilibiliUploader:
         cover_path = None
         if original_thumbnail and os.path.exists(original_thumbnail):
             try:
-                # Use translated title for summary if possible
-                summary_text = self.cover_proc.get_summary(bili_title, description=original_description)
+                summary_text = self.cover_proc.get_summary(bili_title)
                 cover_path = os.path.abspath(os.path.join(os.path.dirname(file_path), "cover_custom.jpg"))
                 if self.cover_proc.generate_cover(original_thumbnail, summary_text, cover_path):
                     logger.info(f"Custom cover generated: {cover_path}")
                 else:
-                    cover_path = os.path.abspath(original_thumbnail) 
+                    cover_path = os.path.abspath(original_thumbnail)
             except Exception as e:
                 logger.error(f"Cover processing failed: {e}")
                 cover_path = os.path.abspath(original_thumbnail)
 
         tid = tid_override if tid_override is not None else self.config['bilibili'].get('tid', 171)
         desc_prefix = self.config['bilibili'].get('desc_prefix', '')
-
-        # Combine translated description with original link and prefix
         final_description = f"{bili_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
         tags = tags_override if tags_override is not None else []
 
-        # Step 3: Upload Command
         copyright_val = copyright_override if copyright_override in (1, 2) else 1
-        cmd = [
-            self.biliup_path, 'upload', file_path,
-            '--title', bili_title,
-            '--tid', str(tid),
-            '--tag', ','.join(tags),
-            '--desc', final_description,
-            '--copyright', str(copyright_val)
-        ]
-        if copyright_val == 2:
-            cmd += ['--source', source_override or source_url]
-        
-        if cover_path and os.path.exists(cover_path):
-            cmd += ['--cover', cover_path]
 
-        if dtime_override:
-            cmd += ['--dtime', str(dtime_override)]
-
-        # Step 3: Retry Loop (3x)
+        # Step 3: Upload via biliup Python API
         max_retries = 3
         for attempt in range(max_retries):
-            logger.info(f"Starting Bilibili upload (Attempt {attempt+1}/{max_retries}): {title}")
+            logger.info(f"Starting Bilibili upload (Attempt {attempt+1}/{max_retries}): {bili_title}")
             try:
-                # We use raw subprocess to capture \r based progress streams
-                process = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding='utf-8',
-                    errors='replace',
-                    bufsize=1,
-                    universal_newlines=True
-                )
+                from biliup.plugins.bili_webup import BiliBili, Data
 
-                # Read output line-by-line; handle \r-terminated progress lines
-                # by treating \r as a line separator via universal newlines mode.
-                full_output = []
-                upload_timeout = 3600  # 1 hour max per upload attempt
-                deadline = time.time() + upload_timeout
-                while True:
-                    if time.time() > deadline:
-                        process.kill()
-                        raise Exception("Upload timed out after 1 hour")
-                    line_raw = process.stdout.readline()
-                    if not line_raw:
-                        if process.poll() is not None:
-                            break
-                        continue
-                    line = line_raw.rstrip('\r\n').strip()
-                    if not line:
-                        continue
-                    full_output.append(line)
-                    # Parse progress percentage e.g. [#######] 45%
-                    pct_match = re.search(r'(\d+)%', line)
-                    if pct_match:
-                        pct = int(pct_match.group(1))
+                video = Data()
+                video.title = bili_title[:80]
+                video.tid = tid
+                video.desc = final_description
+                video.copyright = copyright_val
+                if copyright_val == 2:
+                    video.source = source_override or source_url
+                video.set_tag(tags)
+                if dtime_override:
+                    video.delay_time(dtime_override)
+
+                with BiliBili(video) as bili:
+                    # Load cookies
+                    with open(self.cookie_file, 'r', encoding='utf-8') as f:
+                        cookies_data = json.load(f)
+                    bili.login_by_cookies(cookies_data)
+
+                    # Upload video file with progress reporting
+                    if progress_callback:
+                        progress_callback(5, "开始上传视频文件...")
+
+                    logger.info(f"Uploading video file: {file_path}")
+
+                    # Intercept biliup's chunk-level logger to report real-time progress
+                    _biliup_logger = logging.getLogger('biliup')
+                    class _ProgressHandler(logging.Handler):
+                        def emit(self, record):
+                            if progress_callback:
+                                msg = record.getMessage()
+                                m = re.search(r'=>\s*([\d.]+)%', msg)
+                                if m:
+                                    chunk_pct = float(m.group(1))
+                                    # Map 0-100% chunk progress to 5-83% overall
+                                    overall = 5 + chunk_pct * 0.78
+                                    progress_callback(int(overall), f"上传中 {chunk_pct:.1f}%")
+                    _ph = _ProgressHandler()
+                    _biliup_logger.addHandler(_ph)
+                    try:
+                        video_part = bili.upload_file(file_path, lines='AUTO', tasks=3)
+                    finally:
+                        _biliup_logger.removeHandler(_ph)
+                    video_part['title'] = video_part['title'][:80]
+                    video.append(video_part)
+
+                    if progress_callback:
+                        progress_callback(85, "视频上传完成，处理封面...")
+
+                    # Upload cover
+                    if cover_path and os.path.exists(cover_path):
+                        try:
+                            cover_url = bili.cover_up(cover_path).replace('http:', '')
+                            video.cover = cover_url
+                            logger.info(f"Cover uploaded: {cover_url}")
+                        except Exception as e:
+                            logger.warning(f"Cover upload failed (non-fatal): {e}")
+
+                    if progress_callback:
+                        progress_callback(95, "提交稿件...")
+
+                    # Submit
+                    ret = bili.submit('web')
+                    if ret.get('code') == 0:
+                        logger.info(f"Bilibili upload success: {bili_title}, aid={ret.get('data', {}).get('aid')}")
                         if progress_callback:
-                            progress_callback(pct, f"Bilibili上传中... {pct}%")
-
-                    if "Upload success" in line or "投稿成功" in line:
-                        logger.info(f"Bilibili upload success: {title}")
-
-                process.wait()
-                if process.returncode == 0:
-                    return True
-                else:
-                    error_msg = "\n".join(full_output[-20:]) # Get last 20 lines of output
-                    logger.error(f"Upload attempt {attempt+1} failed (code {process.returncode}). Output:\n{error_msg}")
-                    time.sleep(5) # Cooldown before retry
+                            progress_callback(100, "上传成功!")
+                        return True
+                    else:
+                        raise Exception(f"Submit failed: {ret}")
 
             except Exception as e:
-                logger.error(f"Error during Bilibili upload attempt {attempt+1}: {e}")
-                time.sleep(5)
-        
+                logger.error(f"Upload attempt {attempt+1} failed: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(5)
+
         return False

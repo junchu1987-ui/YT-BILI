@@ -168,7 +168,7 @@ class VideoProcessor:
         if not os.path.exists(matched_intro):
             logging.info(f"GPU Pre-aligner: Matching intro to {m['width']}x{m['height']} @ {fps_val:.3f}fps")
 
-            vf_str = f"scale={m['width']}:{m['height']}:force_original_aspect_ratio=decrease,pad={m['width']}:{m['height']}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+            vf_str = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
 
             cmd_intro = [
                 self.ffmpeg_path, '-y',
@@ -195,7 +195,8 @@ class VideoProcessor:
         merge_enc = v_enc if use_qsv else v_enc
         logging.info(f"Merging with {merge_enc} (fps={fps_val:.3f})")
 
-        filter_str = "[0:v]format=yuv420p[v0];[1:v]format=yuv420p[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]"
+        normalize = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+        filter_str = f"[0:v]{normalize}[v0];[1:v]{normalize}[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]"
         fps_frac = m['fps']  # e.g. "60000/1001" or "30/1"
         if use_qsv:
             cmd_merge = [
@@ -228,7 +229,7 @@ class VideoProcessor:
                 self.ffmpeg_path, '-y',
                 '-i', matched_intro,
                 '-i', filepath,
-                '-filter_complex', "[0:v][0:a][1:v][1:a]concat=n=2:v=1:a=1[outv][outa]",
+                '-filter_complex', f"[0:v]{normalize}[v0];[1:v]{normalize}[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]",
                 '-map', '[outv]', '-map', '[outa]',
                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
                 '-c:a', 'aac', '-b:a', a_bitrate,

@@ -11,12 +11,28 @@ const S = {
   errors: [],
   progress: {},
   current_video: null,
-  selectedFormats: {}, // videoID -> Set of formatIDs
-  uploadMeta: {},      // videoID -> { title, tid, tags: [] }
-  globalTid: 171,
+  selectedFormats: {},   // videoID -> Set of formatIDs
+  formatsExpanded: {},  // videoID -> bool, default false (collapsed)
+  metaExpanded: {},     // videoID -> bool, default false (collapsed)
+  uploadMeta: {},       // videoID -> { title, tid, tags: [] }
+  globalTid: 122,
   defaultTags: [],
 };
 let selectedIds = new Set();   // for download step checkbox selection
+
+// ── Upload meta persistence ───────────────────────────────────────────────────
+let _saveMetaTimer = null;
+function scheduleMetaSave(vid) {
+  clearTimeout(_saveMetaTimer);
+  _saveMetaTimer = setTimeout(() => {
+    const payload = vid ? { [vid]: S.uploadMeta[vid] } : S.uploadMeta;
+    fetch('/api/upload_meta/save', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ meta: payload })
+    }).catch(() => {});
+  }, 500);
+}
 
 // ── Tab router ────────────────────────────────────────────────────────────────
 document.querySelectorAll('.nav-link').forEach(link => {
@@ -30,6 +46,7 @@ document.querySelectorAll('.nav-link').forEach(link => {
     if (tab === 'sources') loadSources();
     if (tab === 'history') loadHistory();
     if (tab === 'settings') loadSettings();
+    if (tab === 'calendar') loadCalendar();
   });
 });
 
@@ -63,12 +80,18 @@ function connectSSE() {
   const es = new EventSource('/events');
 
   es.addEventListener('snapshot', e => {
-    Object.assign(S, JSON.parse(e.data));
+    const d = JSON.parse(e.data);
+    Object.assign(S, d);
+    // Restore persisted uploadMeta from backend (snake_case -> camelCase)
+    if (d.upload_meta && Object.keys(d.upload_meta).length) {
+      S.uploadMeta = d.upload_meta;
+    }
     renderPipeline();
   });
   es.addEventListener('state', e => {
     const d = JSON.parse(e.data);
     Object.assign(S, d);
+    if (d.upload_meta) S.uploadMeta = d.upload_meta;
     renderPipeline();
   });
   es.addEventListener('progress', e => {
@@ -114,17 +137,19 @@ document.getElementById('btn-cancel').addEventListener('click', async () => {
 });
 
 // ── Pipeline renderer ─────────────────────────────────────────────────────────
-const stepIds = ['scan', 'download', 'transcode', 'upload'];
+const stepIds = ['scan', 'download', 'transcode', 'translate', 'upload'];
 const stepMap = {
-  idle:           { active: 'scan' },
+  idle:            { active: 'scan' },
   scanning:        { active: 'scan', busy: true },
   scan_done:       { done: ['scan'], active: 'download' },
   downloading:     { done: ['scan'], active: 'download', busy: true },
   download_done:   { done: ['scan','download'], active: 'transcode' },
   transcoding:     { done: ['scan','download'], active: 'transcode', busy: true },
-  transcode_done:  { done: ['scan','download','transcode'], active: 'upload' },
-  uploading:       { done: ['scan','download','transcode'], active: 'upload', busy: true },
-  done:            { done: ['scan','download','transcode','upload'] },
+  transcode_done:  { done: ['scan','download','transcode'], active: 'translate' },
+  translating:     { done: ['scan','download','transcode'], active: 'translate', busy: true },
+  translate_done:  { done: ['scan','download','transcode','translate'], active: 'upload' },
+  uploading:       { done: ['scan','download','transcode','translate'], active: 'upload', busy: true },
+  done:            { done: ['scan','download','transcode','translate','upload'] },
 };
 
 function renderPipeline() {
@@ -220,9 +245,32 @@ function renderActionPanel(sm) {
         <div class="result-stat ok"><span class="num">${okCnt}</span>成功</div>
         ${errCnt?`<div class="result-stat fail"><span class="num">${errCnt}</span>失败</div>`:''}
       </div>
-      <div class="action-desc">确认后将视频上传至 B站。</div>
+      <div class="action-desc">点击开始 AI 翻译视频标题，翻译完成后可上传。</div>
+      <div class="action-footer">
+        <button class="btn btn-primary" onclick="doTranslate()" ${okCnt===0?'disabled':''}>🌐 开始翻译</button>
+        <button class="btn btn-ghost" onclick="doRescan()">🔍 重新扫描队列</button>
+      </div>`;
+
+  } else if (status === 'translating') {
+    html = `
+      <div class="action-title">正在翻译标题...</div>
+      <div class="action-desc">调用 AI 翻译各视频标题，请稍候。</div>
+      <div class="action-footer"><div class="spinner"></div><span style="color:var(--text2)">请稍候</span></div>`;
+
+  } else if (status === 'translate_done') {
+    const okCnt = S.transcoded.length;
+    const errCnt = S.errors.filter(e => e.step==='translate').length;
+    html = `
+      <div class="action-title">翻译完成</div>
+      <div class="result-summary">
+        <div class="result-stat ok"><span class="num">${okCnt}</span>待上传</div>
+        ${errCnt?`<div class="result-stat fail"><span class="num">${errCnt}</span>翻译失败</div>`:''}
+      </div>
+      <div class="action-desc">确认标题无误后上传至 B站，也可对单条视频重新翻译。</div>
       <div class="action-footer">
         <button class="btn btn-green" onclick="doUpload()" ${okCnt===0?'disabled':''}>🚀 上传至 B站</button>
+        <button class="btn btn-ghost" onclick="doTranslate()">🔄 重新翻译全部</button>
+        <button class="btn btn-ghost" onclick="doRescan()">🔍 重新扫描队列</button>
       </div>`;
 
   } else if (status === 'uploading') {
@@ -264,8 +312,12 @@ function renderVideoSection() {
     titleEl.textContent = '发现的视频';
     showCheckbox = true;
     selWrap.style.display = '';
-  } else if (['downloading', 'download_done', 'transcoding', 'transcode_done', 'uploading', 'done'].includes(status)) {
-    // Show downloaded list with progress
+  } else if (['transcode_done', 'translating', 'translate_done', 'uploading', 'done'].includes(status)) {
+    items = S.transcoded;
+    titleEl.textContent = '处理进度';
+    showCheckbox = false;
+    selWrap.style.display = 'none';
+  } else if (['downloading', 'download_done', 'transcoding'].includes(status)) {
     items = S.candidates.filter(c => !c.already_downloaded);
     titleEl.textContent = '处理进度';
     showCheckbox = false;
@@ -380,23 +432,69 @@ function renderVideoSection() {
     itemRow.id = 'vi-' + c.id;
 
     const thumbUrl = `https://i.ytimg.com/vi/${c.id}/mqdefault.jpg`;
+    const showFmtToggle = showCheckbox && !isSkip && c.formats && c.formats.length;
+    const expanded = !!S.formatsExpanded[c.id];
+    const selectedLabel = S.selectedFormats[c.id]
+        ? [...S.selectedFormats[c.id]].join('+') : (c.rec_format_id || '');
+    const fmtToggleBtn = showFmtToggle
+        ? `<button class="btn-fmt-toggle" data-vid="${c.id}"><span class="fmt-sel-label">${escHtml(selectedLabel)}</span><span class="fmt-arrow">${expanded ? '▲' : '▼'}</span></button>`
+        : '';
+    const showMetaToggle = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
+    const metaExp = !!S.metaExpanded[c.id];
+    const metaToggleBtn = showMetaToggle
+        ? `<button class="btn-meta-toggle" data-vid="${c.id}">编辑 <span class="fmt-arrow">${metaExp ? '▲' : '▼'}</span></button>`
+        : '';
+    const showDelBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
+    const showDoneBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
+    const showUploadBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
+    const showRetranslateBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
+    const displayTitle = (S.uploadMeta[c.id] && S.uploadMeta[c.id].title) ? S.uploadMeta[c.id].title : (c.translated_title || c.title);
+    const showOrigTitle = displayTitle !== c.title;
     itemRow.innerHTML = `
       ${isDraggable ? '<div class="drag-handle">⠿</div>' : ''}
       ${chk}
       <img class="video-thumb" src="${thumbUrl}" alt="" loading="lazy">
       <div class="video-info">
-        <div class="video-title" title="${escHtml(c.title)}">${escHtml(c.title)}</div>
+        <div class="video-title" title="${escHtml(displayTitle)}">${escHtml(displayTitle)}</div>
+        ${showOrigTitle ? `<div class="video-orig-title" title="${escHtml(c.title)}">${escHtml(c.title)}</div>` : ''}
         <div class="video-meta">${c.id} · ${labelType(c.url_type)}</div>
       </div>
       ${progHtml}
-      ${statusBadge}`;
+      ${statusBadge}
+      ${fmtToggleBtn}
+      ${metaToggleBtn}
+      ${showDelBtn ? `<button class="btn-del-meta" data-vid="${c.id}" title="从上传队列移除">✕</button>` : ''}
+      ${showDoneBtn ? `<button class="btn-mark-done" data-vid="${c.id}" title="标记为已手动上传">✓ 已上传</button>` : ''}
+      ${showRetranslateBtn ? `<button class="btn-retranslate btn-retry" data-vid="${c.id}" title="重新翻译此视频标题">↺ 重翻</button>` : ''}
+      ${showUploadBtn ? `<button class="btn-upload-single btn-retry" data-vid="${c.id}" title="立即上传此视频">⬆ 上传</button>` : ''}`;
+
+    if (showDelBtn) {
+        itemRow.querySelector('.btn-del-meta').addEventListener('click', () => {
+            fetch(`/api/upload_meta/${c.id}`, { method: 'DELETE' }).catch(() => {});
+        });
+    }
+    if (showDoneBtn) {
+        itemRow.querySelector('.btn-mark-done').addEventListener('click', () => {
+            fetch(`/api/upload_meta/${c.id}/done`, { method: 'POST' }).catch(() => {});
+        });
+    }
+    if (showRetranslateBtn) {
+        itemRow.querySelector('.btn-retranslate').addEventListener('click', () => {
+            fetch(`/api/translate/${c.id}`, { method: 'POST' }).catch(() => {});
+        });
+    }
+    if (showUploadBtn) {
+        itemRow.querySelector('.btn-upload-single').addEventListener('click', () => {
+            fetch(`/api/upload/${c.id}`, { method: 'POST' }).catch(() => {});
+        });
+    }
     
     row.appendChild(itemRow);
 
     // Formats List (only for scan_done and not skipped)
-    if (showCheckbox && !isSkip && c.formats && c.formats.length) {
+    if (showFmtToggle) {
         const formatsWrap = document.createElement('div');
-        formatsWrap.className = 'video-formats';
+        formatsWrap.className = 'video-formats' + (expanded ? '' : ' collapsed');
 
         // Auto-preselect recommended formats on first render
         if (c.rec_format_id && !S.selectedFormats[c.id]) {
@@ -410,11 +508,11 @@ function renderVideoSection() {
             fmtItem.className = 'format-item' + (isSelected ? ' selected' : '') + (f.recommended ? ' recommended' : '');
             fmtItem.dataset.vid = c.id;
             fmtItem.dataset.fid = f.format_id;
-            
+
             const isCombo = f.vcodec !== 'none' && f.acodec !== 'none';
             const isAudio = f.vcodec === 'none' && f.acodec !== 'none';
             const isVideo = f.acodec === 'none' && f.vcodec !== 'none';
-            
+
             fmtItem.innerHTML = `
                 <div class="format-check"></div>
                 <div class="format-id">${f.format_id}</div>
@@ -427,14 +525,17 @@ function renderVideoSection() {
                     ${f.recommended ? '<span class="tag rec">推荐</span>' : ''}
                 </div>
             `;
-            
+
             fmtItem.addEventListener('click', () => {
                 if (!S.selectedFormats[c.id]) S.selectedFormats[c.id] = new Set();
                 const set = S.selectedFormats[c.id];
                 if (set.has(f.format_id)) set.delete(f.format_id);
                 else set.add(f.format_id);
-                
+
                 fmtItem.classList.toggle('selected');
+                // Sync label on toggle button
+                const lbl = itemRow.querySelector('.fmt-sel-label');
+                if (lbl) lbl.textContent = [...set].join('+');
                 // Ensure parent checkbox is checked if any format is selected
                 if (set.size > 0) {
                     selectedIds.add(c.id);
@@ -442,14 +543,26 @@ function renderVideoSection() {
                     if (pChk) pChk.checked = true;
                 }
             });
-            
+
             formatsWrap.appendChild(fmtItem);
         });
+
+        // Toggle button event
+        const toggleBtn = itemRow.querySelector('.btn-fmt-toggle');
+        if (toggleBtn) {
+            toggleBtn.addEventListener('click', () => {
+                S.formatsExpanded[c.id] = !S.formatsExpanded[c.id];
+                formatsWrap.classList.toggle('collapsed');
+                toggleBtn.querySelector('.fmt-arrow').textContent =
+                    S.formatsExpanded[c.id] ? '▲' : '▼';
+            });
+        }
+
         row.appendChild(formatsWrap);
     }
 
     // Upload meta editor (only when waiting for upload)
-    if (status === 'transcode_done' && isTranscoded && !isUploaded) {
+    if (['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded) {
         if (!S.uploadMeta[c.id]) {
             S.uploadMeta[c.id] = {
                 title: c.translated_title || c.title || '',
@@ -476,7 +589,7 @@ function renderVideoSection() {
             .toISOString().slice(0, 16);
         const isScheduled = !!m.schedule_time;
         const editor = document.createElement('div');
-        editor.className = 'upload-meta-editor';
+        editor.className = 'upload-meta-editor' + (metaExp ? '' : ' collapsed');
         editor.innerHTML = `
           <div class="meta-field">
             <label>标题</label>
@@ -537,6 +650,7 @@ function renderVideoSection() {
                 btn.addEventListener('click', () => {
                     m.tags.splice(Number(btn.dataset.i), 1);
                     renderMetaTags();
+                    scheduleMetaSave(c.id);
                 });
             });
         }
@@ -545,23 +659,24 @@ function renderVideoSection() {
         const tagInput = editor.querySelector('.meta-tag-input');
         const addTag = () => {
             const val = tagInput.value.trim();
-            if (val && !m.tags.includes(val)) { m.tags.push(val); renderMetaTags(); }
+            if (val && !m.tags.includes(val)) { m.tags.push(val); renderMetaTags(); scheduleMetaSave(c.id); }
             tagInput.value = '';
         };
         editor.querySelector('.btn-tag-add').addEventListener('click', addTag);
         tagInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } });
         // Sync other fields
-        editor.querySelector('.meta-title').addEventListener('input', e => { S.uploadMeta[c.id].title = e.target.value; });
-        editor.querySelector('.meta-tid').addEventListener('change', e => { S.uploadMeta[c.id].tid = e.target.value; });
+        editor.querySelector('.meta-title').addEventListener('input', e => { S.uploadMeta[c.id].title = e.target.value; scheduleMetaSave(c.id); });
+        editor.querySelector('.meta-tid').addEventListener('change', e => { S.uploadMeta[c.id].tid = e.target.value; scheduleMetaSave(c.id); });
         // Copyright radio toggle
         editor.querySelectorAll(`input[name="cr-${c.id}"]`).forEach(radio => {
             radio.addEventListener('change', () => {
                 const sourceInput = editor.querySelector('.meta-source');
                 S.uploadMeta[c.id].copyright = Number(radio.value);
                 sourceInput.style.display = radio.value === '2' ? '' : 'none';
+                scheduleMetaSave(c.id);
             });
         });
-        editor.querySelector('.meta-source').addEventListener('input', e => { S.uploadMeta[c.id].source = e.target.value; });
+        editor.querySelector('.meta-source').addEventListener('input', e => { S.uploadMeta[c.id].source = e.target.value; scheduleMetaSave(c.id); });
         // Schedule radio toggle
         editor.querySelectorAll(`input[name="sched-${c.id}"]`).forEach(radio => {
             radio.addEventListener('change', () => {
@@ -574,11 +689,23 @@ function renderVideoSection() {
                     dtWrap.style.display = 'none';
                     S.uploadMeta[c.id].schedule_time = null;
                 }
+                scheduleMetaSave(c.id);
             });
         });
         editor.querySelector('.meta-schedule-dt').addEventListener('change', e => {
             S.uploadMeta[c.id].schedule_time = e.target.value || null;
+            scheduleMetaSave(c.id);
         });
+        // Meta toggle button event
+        const metaToggle = itemRow.querySelector('.btn-meta-toggle');
+        if (metaToggle) {
+            metaToggle.addEventListener('click', () => {
+                S.metaExpanded[c.id] = !S.metaExpanded[c.id];
+                editor.classList.toggle('collapsed');
+                metaToggle.querySelector('.fmt-arrow').textContent =
+                    S.metaExpanded[c.id] ? '▲' : '▼';
+            });
+        }
         row.appendChild(editor);
     }
 
@@ -651,6 +778,15 @@ async function doUpload() {
   await api('POST', '/api/upload', { meta });
 }
 async function doReset()     { await api('POST', '/api/reset'); }
+async function doTranslate() {
+  await api('POST', '/api/translate');
+}
+
+async function doRescan() {
+  const r = await api('POST', '/api/upload_meta/rescan');
+  if (r && r.added > 0) logLine('info', `重新扫描完成，新增 ${r.added} 个视频到上传队列`);
+  else logLine('info', '重新扫描完成，没有发现新视频');
+}
 async function doRetry(id)     { await api('POST', '/api/retry', { video_id: id }); }
 
 // ── Sources tab ───────────────────────────────────────────────────────────────
@@ -778,15 +914,16 @@ async function loadSettings() {
   const cfg = await api('GET', '/api/config');
   if (!cfg) return;
   document.getElementById('cfg-proxy').value = cfg.proxy || '';
-  S.globalTid = cfg.tid || 171;
-  // Set the select to match current tid, default to 171
+  S.globalTid = cfg.tid || 122;
+  // Set the select to match current tid, default to 122
   const tidSel = document.getElementById('cfg-tid');
-  tidSel.value = String(cfg.tid || 171);
+  tidSel.value = String(cfg.tid || 122);
   // If no matching option found, default to 171
-  if (!tidSel.value) tidSel.value = '171';
+  if (!tidSel.value) tidSel.value = '122';
   document.getElementById('cfg-intro').value = cfg.intro_path || '';
   document.getElementById('cfg-desc').value  = cfg.desc_prefix || '';
   document.getElementById('cfg-zhipu-key').value = cfg.zhipu_key || '';
+  document.getElementById('cfg-upload-interval').value = cfg.upload_interval ?? 30;
   S.defaultTags = cfg.default_tags || ['YouTube', '搬运', 'AI翻译', '中字'];
   renderCfgTags(S.defaultTags);
 
@@ -808,11 +945,12 @@ async function loadSettings() {
 document.getElementById('btn-save-config').addEventListener('click', async () => {
   const cfg = {
     proxy:        document.getElementById('cfg-proxy').value.trim(),
-    tid:          parseInt(document.getElementById('cfg-tid').value) || 171,
+    tid:          parseInt(document.getElementById('cfg-tid').value) || 122,
     intro_path:   document.getElementById('cfg-intro').value.trim(),
     desc_prefix:  document.getElementById('cfg-desc').value,
     zhipu_key:    document.getElementById('cfg-zhipu-key').value.trim(),
     default_tags: S.defaultTags,
+    upload_interval: parseInt(document.getElementById('cfg-upload-interval').value) || 0,
   };
   const res = await api('POST', '/api/config', cfg);
   if (res && res.ok) {
@@ -867,3 +1005,200 @@ async function api(method, url, body) {
 // ── Init ──────────────────────────────────────────────────────────────────────
 connectSSE();
 checkBiliStatus();
+
+// ── Calendar ──────────────────────────────────────────────────────────────────
+
+// ── Mock data (PREVIEW ONLY — replace with api() call when confirmed) ─────────
+const MOCK_META = {
+  'RKOlM6c4lE8': {
+    title: '百年艺术装饰风桌子修复',
+    schedule_time: null,
+    uploaded: true,
+    uploaded_at: Math.floor(new Date('2026-03-30T10:15:00').getTime() / 1000),
+  },
+  'svQL4SUauew': {
+    title: '猫王宝马507修复：最传奇的豪车',
+    schedule_time: null,
+    uploaded: true,
+    uploaded_at: Math.floor(new Date('2026-04-01T09:45:00').getTime() / 1000),
+  },
+  'MvUez7ZbeD0': {
+    title: '英国手工打造摩根传奇跑车',
+    schedule_time: '2026-04-01T14:00',
+    uploaded: false,
+    queued_at: 0,
+  },
+  '60xULkHR5tM': {
+    title: '修复一台老式工坊车床',
+    schedule_time: '2026-04-02T08:30',
+    uploaded: false,
+    queued_at: 0,
+  },
+  'IVlaAxFIi8s': {
+    title: '我洗了史上最脏的毛毯！',
+    schedule_time: '2026-04-02T08:30',
+    uploaded: false,
+    queued_at: 0,
+  },
+  'WfmnFs48BlI': {
+    title: '沼泽泳池大改造',
+    schedule_time: '2026-04-03T20:00',
+    uploaded: false,
+    queued_at: 0,
+  },
+  'tkLW11WSIvY': {
+    title: '恶心泳池华丽变身',
+    schedule_time: '2026-04-04T15:30',
+    uploaded: false,
+    queued_at: 0,
+  },
+  'rCBQZPR9-mQ': {
+    title: '上次那修水管的坑了她，这次请了我',
+    schedule_time: '2026-04-05T11:00',
+    uploaded: false,
+    queued_at: 0,
+  },
+  'nsmp_AYm93M': {
+    title: '把山里那泉弄干净，水池也救活了！',
+    schedule_time: null,
+    uploaded: false,
+    queued_at: 0,
+  },
+  'fnjOmFVavxc': {
+    title: '史上最差阳台！极致ASMR高压水枪清洗',
+    schedule_time: null,
+    uploaded: false,
+    queued_at: 0,
+  },
+  'qd2s1kBO_Gs': {
+    title: '这得多脏？！志愿者帮社区中心清污垢',
+    schedule_time: null,
+    uploaded: false,
+    queued_at: 0,
+  },
+};
+
+const Cal = { weekOffset: 0, meta: null };
+const CAL_START_HOUR = 6;
+const CAL_END_HOUR   = 23;
+const CAL_HOUR_PX    = 60;
+const CAL_DAY_NAMES  = ['周日','周一','周二','周三','周四','周五','周六'];
+const CAL_MONTHS     = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+
+function calWeekSunday(offset) {
+  const now = new Date();
+  const sun = new Date(now);
+  sun.setHours(0, 0, 0, 0);
+  sun.setDate(now.getDate() - now.getDay() + offset * 7);
+  return sun;
+}
+
+function calWeekLabel(sun) {
+  const sat = new Date(sun); sat.setDate(sun.getDate() + 6);
+  const fmt = d => `${d.getMonth()+1}月${d.getDate()}日`;
+  const year = sun.getFullYear();
+  const jan4 = new Date(year, 0, 4);
+  const weekNo = Math.ceil(((sun - jan4) / 86400000 + jan4.getDay() + 1) / 7);
+  return `${year}年 第${weekNo}周  (${fmt(sun)} – ${fmt(sat)})`;
+}
+
+async function loadCalendar() {
+  Cal.meta = await api('GET', '/api/upload_meta');
+  renderCalendar();
+  document.getElementById('cal-prev').onclick  = () => { Cal.weekOffset--; renderCalendar(); };
+  document.getElementById('cal-next').onclick  = () => { Cal.weekOffset++; renderCalendar(); };
+  document.getElementById('cal-today').onclick = () => { Cal.weekOffset = 0; renderCalendar(); };
+}
+
+function renderCalendar() {
+  const sun = calWeekSunday(Cal.weekOffset);
+  document.getElementById('cal-week-label').textContent = calWeekLabel(sun);
+
+  const todayStr = (() => { const t = new Date(); t.setHours(0,0,0,0); return t.toDateString(); })();
+  const grid = document.getElementById('cal-grid');
+  grid.innerHTML = '';
+
+  // Header
+  grid.appendChild(Object.assign(document.createElement('div'), { className: 'cal-header-gutter' }));
+  const days = [];
+  for (let d = 0; d < 7; d++) {
+    const dt = new Date(sun); dt.setDate(sun.getDate() + d);
+    days.push(dt);
+    const isToday = dt.toDateString() === todayStr;
+    const hdr = document.createElement('div');
+    hdr.className = 'cal-header-day' + (isToday ? ' today' : '');
+    hdr.innerHTML = `<span class="cal-date-num">${dt.getDate()}</span>${CAL_DAY_NAMES[d]} · ${CAL_MONTHS[dt.getMonth()]}`;
+    grid.appendChild(hdr);
+  }
+
+  // Build event map  "YYYY-MM-DD|H" -> [{vid, m, dt, minute}]
+  const eventMap = {};
+  const unscheduled = [];
+
+  for (const [vid, m] of Object.entries(Cal.meta || {})) {
+    let dt = null;
+    if (m.schedule_time) {
+      dt = new Date(m.schedule_time);
+    } else if (m.uploaded && m.uploaded_at) {
+      dt = new Date(m.uploaded_at * 1000);
+    }
+    if (!dt || isNaN(dt)) { unscheduled.push({vid, m}); continue; }
+
+    const dateKey = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+    const key = `${dateKey}|${dt.getHours()}`;
+    if (!eventMap[key]) eventMap[key] = [];
+    eventMap[key].push({ vid, m, dt, minute: dt.getMinutes() });
+  }
+
+  // Hour rows
+  for (let h = CAL_START_HOUR; h <= CAL_END_HOUR; h++) {
+    const label = document.createElement('div');
+    label.className = 'cal-hour-label';
+    label.textContent = `${String(h).padStart(2,'0')}:00`;
+    grid.appendChild(label);
+
+    for (let d = 0; d < 7; d++) {
+      const dt = days[d];
+      const isToday = dt.toDateString() === todayStr;
+      const cell = document.createElement('div');
+      cell.className = 'cal-day-cell' + (isToday ? ' today-col' : '');
+
+      const dateKey = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+      (eventMap[`${dateKey}|${h}`] || []).forEach(ev => {
+        const card = document.createElement('div');
+        let cls, badge;
+        if (ev.m.uploaded)         { cls = 'cal-card uploaded';      badge = '✓ 已上传'; }
+        else if (ev.m.schedule_time) { cls = 'cal-card scheduled';   badge = '⏰ 定时';  }
+        else                         { cls = 'cal-card pending-upload'; badge = '⬆ 待传'; }
+        card.className = cls;
+        card.style.top = `${ev.minute}px`;
+        const timeStr = `${String(ev.dt.getHours()).padStart(2,'0')}:${String(ev.dt.getMinutes()).padStart(2,'0')}`;
+        card.innerHTML = `
+          <img src="/api/thumb/${ev.vid}" alt="" loading="lazy">
+          <span class="cal-card-time">${timeStr}</span>
+          <span class="cal-card-title">${escHtml(ev.m.title)}</span>
+          <span class="cal-card-badge">${badge}</span>`;
+        cell.appendChild(card);
+      });
+      grid.appendChild(cell);
+    }
+  }
+
+  // Unscheduled tray
+  const tray = document.getElementById('cal-tray');
+  if (!unscheduled.length) { tray.style.display = 'none'; return; }
+  tray.style.display = '';
+  document.getElementById('cal-tray-count').textContent = unscheduled.length;
+  const trayItems = document.getElementById('cal-tray-items');
+  trayItems.innerHTML = '';
+  unscheduled.forEach(({vid, m}) => {
+    const card = document.createElement('div');
+    card.className = 'cal-tray-card';
+    card.innerHTML = `
+      <img src="/api/thumb/${vid}" alt="" loading="lazy">
+      <div class="cal-tray-card-body">
+        <div class="cal-tray-card-title">${escHtml(m.title)}</div>
+      </div>`;
+    trayItems.appendChild(card);
+  });
+}

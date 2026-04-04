@@ -17,6 +17,7 @@
     <li><a href="#" class="nav-link active" data-tab="pipeline">🚀 流水线</a></li>
     <li><a href="#" class="nav-link" data-tab="sources">📋 来源管理</a></li>
     <li><a href="#" class="nav-link" data-tab="history">🕐 历史记录</a></li>
+    <li><a href="#" class="nav-link" data-tab="calendar">📅 投稿日历</a></li>
     <li><a href="#" class="nav-link" data-tab="settings">⚙️ 设置</a></li>
   </ul>
   <div class="bili-status" id="bili-status">
@@ -64,8 +65,16 @@
         </div>
       </div>
       <div class="step-arrow">›</div>
-      <div class="step" id="step-upload">
+      <div class="step" id="step-translate">
         <div class="step-num">4</div>
+        <div class="step-body">
+          <div class="step-title">翻译</div>
+          <div class="step-desc">AI 标题翻译</div>
+        </div>
+      </div>
+      <div class="step-arrow">›</div>
+      <div class="step" id="step-upload">
+        <div class="step-num">5</div>
         <div class="step-body">
           <div class="step-title">上传</div>
           <div class="step-desc">发布至B站</div>
@@ -306,6 +315,11 @@
         <input type="password" id="cfg-zhipu-key" placeholder="xxxxxxxx.xxxxxxxx">
         <span class="form-hint">用于标题翻译、简介翻译、封面文字生成（<a href="https://bigmodel.cn" target="_blank">bigmodel.cn</a> 免费注册）</span>
       </div>
+      <div class="form-group">
+        <label>上传间隔（秒）</label>
+        <input type="number" id="cfg-upload-interval" min="0" max="3600" style="width:120px">
+        <span class="form-hint">每两个视频上传之间的等待时间，0 表示不等待</span>
+      </div>
       <button class="btn btn-primary" id="btn-save-config">保存设置</button>
       <span class="save-ok" id="save-ok" style="display:none">✓ 已保存</span>
     </div>
@@ -315,6 +329,26 @@
       <h3>B站登录</h3>
       <div id="bili-login-info" class="login-info"></div>
       <p class="form-hint">如 Cookie 过期，请在终端运行: <code>biliup login</code></p>
+    </div>
+  </section>
+
+  <!-- ═══ Tab: Calendar ═══ -->
+  <section class="tab-panel" id="tab-calendar">
+    <div class="page-header">
+      <h1>投稿日历</h1>
+      <div class="cal-nav" id="cal-nav">
+        <button class="btn btn-ghost btn-sm" id="cal-prev">‹</button>
+        <span class="cal-week-label" id="cal-week-label"></span>
+        <button class="btn btn-ghost btn-sm" id="cal-next">›</button>
+        <button class="btn btn-ghost btn-sm" id="cal-today">本周</button>
+      </div>
+    </div>
+    <div class="cal-scroll">
+      <div class="cal-grid" id="cal-grid"></div>
+    </div>
+    <div class="cal-tray" id="cal-tray" style="display:none">
+      <div class="cal-tray-title">待上传<span class="count-badge" id="cal-tray-count">0</span></div>
+      <div class="cal-tray-items" id="cal-tray-items"></div>
     </div>
   </section>
 
