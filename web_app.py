@@ -805,6 +805,7 @@ def _do_upload_single(vid, c, uploader, cfg):
     copyright_override = int(meta['copyright']) if meta.get('copyright') in (1, 2, '1', '2') else None
     source_override = meta.get('source') or None
     desc_override = meta.get('desc') or None
+    cover_text = meta.get('cover_text') or None
 
     file_path = meta.get('local_path') or ''
     if not file_path or not os.path.isfile(file_path):
@@ -836,7 +837,8 @@ def _do_upload_single(vid, c, uploader, cfg):
         title_already_translated='translated_title' in c,
         copyright_override=copyright_override,
         source_override=source_override,
-        desc_override=desc_override
+        desc_override=desc_override,
+        cover_text=cover_text
     )
     if res:
         with state_lock:
@@ -950,7 +952,7 @@ def save_upload_meta():
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
     # Merge into persistent file — only update editable fields, preserve uploaded/local_path etc.
-    EDITABLE = {'title', 'tid', 'tags', 'copyright', 'source', 'schedule_time', 'desc'}
+    EDITABLE = {'title', 'tid', 'tags', 'copyright', 'source', 'schedule_time', 'desc', 'cover_text'}
     disk_meta = _load_upload_meta(work_dir)
     for vid, fields in incoming.items():
         if vid in disk_meta:

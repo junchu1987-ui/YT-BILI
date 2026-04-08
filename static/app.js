@@ -573,12 +573,16 @@ function renderVideoSection() {
                 schedule_time: null,
                 copyright: 1,
                 source: c.url || '',
-                desc: ''
+                desc: '',
+                cover_text: ''
             };
         }
         // Backfill desc from server-pushed upload_meta if not yet set locally
         if (S.uploadMeta[c.id].desc === undefined) {
             S.uploadMeta[c.id].desc = '';
+        }
+        if (S.uploadMeta[c.id].cover_text === undefined) {
+            S.uploadMeta[c.id].cover_text = '';
         }
         // Ensure tags is always an array
         if (!Array.isArray(S.uploadMeta[c.id].tags)) {
@@ -601,6 +605,12 @@ function renderVideoSection() {
           <div class="meta-field">
             <label>标题</label>
             <input type="text" class="meta-title" value="${m.title.replace(/"/g, '&quot;')}">
+          </div>
+          <div class="meta-field">
+            <label>封面文字</label>
+            <input type="text" class="meta-cover-text" maxlength="6"
+                   value="${escHtml(m.cover_text || '')}"
+                   placeholder="留空则不加文字（最多6字）">
           </div>
           <div class="meta-field">
             <label>分区</label>
@@ -678,6 +688,7 @@ function renderVideoSection() {
         tagInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } });
         // Sync other fields
         editor.querySelector('.meta-title').addEventListener('input', e => { S.uploadMeta[c.id].title = e.target.value; scheduleMetaSave(c.id); });
+        editor.querySelector('.meta-cover-text').addEventListener('input', e => { S.uploadMeta[c.id].cover_text = e.target.value; scheduleMetaSave(c.id); });
         editor.querySelector('.meta-tid').addEventListener('change', e => { S.uploadMeta[c.id].tid = e.target.value; scheduleMetaSave(c.id); });
         // Copyright radio toggle
         editor.querySelectorAll(`input[name="cr-${c.id}"]`).forEach(radio => {

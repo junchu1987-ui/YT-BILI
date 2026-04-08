@@ -222,7 +222,7 @@ class VideoProcessor:
         # ffmpeg subtitles filter on Windows needs forward slashes and escaped colons
         safe_path = srt_path.replace('\\', '/').replace(':', '\\:')
         style = (f"PlayResX=1920,PlayResY=1080,Alignment=2,MarginV={margin_v},"
-                 f"FontSize={font_size},PrimaryColour={colour},"
+                 f"Fontname=SimSun,FontSize={font_size},PrimaryColour={colour},"
                  f"OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=0,"
                  f"WrapStyle=1")
         return f"subtitles='{safe_path}':force_style='{style}'"
@@ -309,7 +309,7 @@ class VideoProcessor:
         # Build subtitle burn-in chain (appended after concat)
         sub_filters = []
         for vtt_key, margin_v, font_size, colour in [
-            ('subtitle_zh', 20, 28, '&H00FFFFFF&'),   # 中文：白色，底部贴边
+            ('subtitle_zh', 20, 30, '&H00FFFFFF&'),   # 中文：白色，底部贴边
         ]:
             vtt_path = video_data.get(vtt_key, '')
             if vtt_path and os.path.isfile(vtt_path):

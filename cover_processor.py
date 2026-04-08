@@ -138,3 +138,17 @@ class CoverProcessor:
         except Exception as e:
             logger.error(f"Failed to generate cover: {e}")
             return False
+
+    def convert_to_jpg(self, source_image_path, output_path):
+        """Resize thumbnail to 1920x1080 and save as JPEG without any text overlay."""
+        try:
+            img = Image.open(source_image_path).convert("RGB")
+            img = img.resize((1920, 1080), Image.Resampling.LANCZOS)
+            img.save(output_path, "JPEG", quality=90, optimize=True)
+            if os.path.getsize(output_path) > 2 * 1024 * 1024:
+                img.save(output_path, "JPEG", quality=75, optimize=True)
+            logger.info(f"Cover converted to JPG (no text): {output_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to convert cover to JPG: {e}")
+            return False

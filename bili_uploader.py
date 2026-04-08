@@ -14,7 +14,7 @@ class BilibiliUploader:
         self.cookie_file = 'cookies.json'
         self.cover_proc = CoverProcessor(config)
 
-    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None, desc_override=None):
+    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None, desc_override=None, cover_text=None):
         """
         Uploads a video to Bilibili using biliup's internal Python API (no CLI).
         """
@@ -53,16 +53,21 @@ class BilibiliUploader:
         # Ensure absolute path for video
         file_path = os.path.abspath(file_path)
 
-        # Step 2: Automated Cover Processing
+        # Step 2: Cover Processing (manual text or plain JPG)
         cover_path = None
         if original_thumbnail and os.path.exists(original_thumbnail):
             try:
-                summary_text = self.cover_proc.get_summary(bili_title)
                 cover_path = os.path.abspath(os.path.join(os.path.dirname(file_path), "cover_custom.jpg"))
-                if self.cover_proc.generate_cover(original_thumbnail, summary_text, cover_path):
-                    logger.info(f"Custom cover generated: {cover_path}")
+                if cover_text and cover_text.strip():
+                    if self.cover_proc.generate_cover(original_thumbnail, cover_text.strip(), cover_path):
+                        logger.info(f"Custom cover generated with text: {cover_path}")
+                    else:
+                        cover_path = os.path.abspath(original_thumbnail)
                 else:
-                    cover_path = os.path.abspath(original_thumbnail)
+                    if self.cover_proc.convert_to_jpg(original_thumbnail, cover_path):
+                        logger.info(f"Cover converted to JPG (no text): {cover_path}")
+                    else:
+                        cover_path = os.path.abspath(original_thumbnail)
             except Exception as e:
                 logger.error(f"Cover processing failed: {e}")
                 cover_path = os.path.abspath(original_thumbnail)
