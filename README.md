@@ -1,69 +1,130 @@
-# YouTube to Bilibili Automation
+# YT-BILI
 
-这是一个自动化工具，用于监控特定YouTube频道，下载最新的最高画质视频（支持4K/1080P）和音频，使用 `ffmpeg` 自动转码并拼接预设的片头，最后通过 `biliup` 自动上传至Bilibili。
+YouTube to Bilibili 自动搬运工具。提供 Web UI，支持全流程：扫描 → 下载 → 转码（片头拼接 + 字幕烧录） → AI 翻译 → B站上传。
 
-## 环境依赖准备
+## 功能
 
-1. **Python 3.8+**
-2. **FFmpeg**: 必须安装 FFmpeg 并将其加入到系统的PATH环境变量中。
-   - Linux: `sudo apt install ffmpeg` 或 `sudo yum install ffmpeg`
-   - Windows: 下载可执行文件并添加到系统环境变量。
+- **数据源管理**：支持 YouTube 频道/播放列表/单个视频，Web UI 添加删除
+- **智能扫描**：自动获取视频格式信息，推荐最优下载格式（优先 combined format），7 天缓存
+- **视频下载**：yt-dlp 引擎，支持代理、cookie、自动下载字幕和缩略图
+- **GPU 转码**：FFmpeg + Intel QSV 硬件加速（自动 fallback 到 libx264），片头拼接、字幕烧录
+- **AI 翻译**：GLM-4-Flash 翻译标题和简介，独立步骤可单条重翻
+- **封面处理**：用户可在上传前输入封面文字（最多 6 字），自动生成带艺术文字的封面；不输入则使用原始缩略图
+- **B站上传**：biliup Python API，支持分区/标签/版权/定时投递/上传间隔，实时进度
+- **上传队列**：upload_meta.json 持久化，支持编辑元数据、单条上传、手动标记已完成、重新扫描队列
+- **投稿日历**：周历视图，可视化定时投递和已上传视频
+- **实时通信**：SSE 事件流推送状态/日志/进度到前端
 
-3. **Python 库安装**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## 架构
 
-## 首次配置与运行流程
+```
+Browser ──HTTP/SSE──▶ Flask (web_app.py)
+                          │
+                    ┌─────┴──────┐
+                    ▼            ▼
+              REST API      SSE /events
+                    │
+        ┌───────────┼───────────┬────────────┬──────────┐
+        ▼           ▼           ▼            ▼          ▼
+    run_scan   run_download  run_transcode  run_translate  run_upload
+    (yt-dlp)   (yt-dlp+FFmpeg) (VideoProcessor) (CoverProcessor) (BilibiliUploader)
+        │           │           │            │          │
+        ▼           ▼           ▼            ▼          ▼
+     YouTube     data/       FFmpeg       GLM-4-Flash  Bilibili API
+                 *.mp4       QSV/x264     (智谱 AI)    (biliup)
+```
 
-### 1. 修改配置文件 (`config.yaml`)
-编辑 `config.yaml` 文件：
-- **`proxy`**: 如果在国内服务器或本地运行，必须配置科学上网代理（如 `socks5://127.0.0.1:10808` 或 `http://127.0.0.1:10809`）。
-- **`channel_url`**: 填入需要搬运的 YouTube 频道首页地址（如 `https://www.youtube.com/@xxx/videos`）。
-- **`intro_video_path`**: 准备一个片头视频（尽量简短，会被自动转码适配主视频画质），放在对应路径。如果没有片头需求，可以将此项留空。
-- **`tid`**: 指定B站分区ID（例如17是单机游戏，需查询B站分区列表）。
+详细架构图见 `ytbili_arch.pdf`（Graphviz 生成）。
 
-### 2. 准备 Bilibili Cookie (`cookies.json`)
-本工具使用 `biliup` 进行上传，需要先在环境中登录：
-在终端执行以下命令并扫码登录：
+## 环境依赖
+
+- Python 3.8+
+- FFmpeg（建议含 Intel QSV 支持）
+- [biliup](https://github.com/biliup/biliup)（B站上传）
+- [yt-dlp](https://github.com/yt-dlp/yt-dlp)（YouTube 下载）
+- Bun.js（可选，加速 yt-dlp JS 运行时）
+
+## 安装
+
+```bash
+git clone https://github.com/junchu1987-ui/YT-BILI.git
+cd YT-BILI
+pip install -r requirements.txt
+```
+
+## 配置
+
+编辑 `config.yaml`：
+
+```yaml
+app:
+  work_dir: ./data          # 工作目录
+  proxy: socks5://127.0.0.1:10808  # YouTube 代理（B站上传不走代理）
+  host: 127.0.0.1
+  port: 5000
+
+youtube:
+  sources: []               # Web UI 中添加
+
+ffmpeg:
+  bin_path: ffmpeg           # FFmpeg 路径
+  intro_video_path: ./assets/intro.mp4  # 片头视频（留空则不拼接）
+
+bilibili:
+  tid: 122                  # 默认分区 ID
+  desc_prefix: '本视频搬运自YouTube。\n\n原视频链接：{youtube_url}\n\n'
+  default_tags:             # 默认标签
+    - YouTube
+    - 搬运
+  upload_interval: 30       # 连续上传间隔（秒）
+
+zhipu:
+  api_key: ''               # 智谱 AI API Key（用于标题翻译和封面摘要）
+```
+
+## Bilibili 登录
+
+首次使用需扫码登录生成 `cookies.json`：
+
 ```bash
 biliup login
 ```
-登录成功后，会在当前目录下生成 `cookies.json` 文件。请妥善保管！
 
-*(如果在纯命令行 Linux 服务器上运行，可以在本地机器使用 `biliup login` 生成 `cookies.json` 后，将其上传复制到服务器的本目录中。)*
+登录成功后 `cookies.json` 出现在当前目录。Cookie 有效期约 30 天，Web UI 侧边栏会提示过期。
 
-### 3. 测试运行
-在配置好 `config.yaml` 和 `cookies.json`，且备好了片头视频后，进行首次测试运行：
+## 运行
+
 ```bash
-python main.py
+python web_app.py
 ```
 
-## 按需运行（当前模式）
+浏览器访问 `http://127.0.0.1:5000`。
 
-本工具当前采用**手动按需触发**模式。每次您想要执行一次完整的"检查-下载-处理-上传"流程时，有两种方式：
+## 使用流程
 
-### 方式一：双击运行（推荐）
+1. **设置** — 侧边栏配置代理、分区、标签、API Key 等
+2. **添加源** — 输入 YouTube 频道/播放列表/视频 URL
+3. **扫描** — 点击扫描，发现候选视频并推荐下载格式
+4. **下载** — 勾选视频，选择格式，开始下载（自动获取字幕和缩略图）
+5. **转码** — 自动拼接片头、烧录中文字幕（宋体 30px），生成 `*_final.mp4`
+6. **翻译** — AI 翻译标题和简介，支持一键全翻或逐条重翻
+7. **编辑** — 修改标题、封面文字、分区、标签、版权、定时发布、简介
+8. **上传** — 单条上传或批量上传至 B站
 
-直接双击项目目录下的 **`run.bat`** 文件，脚本会自动：
-1. 切换到正确的工作目录
-2. 执行 `python main.py`
-3. 完成后暂停等待查看日志
+## 本地文件结构
 
-> [!IMPORTANT]
-> 运行前请确保 **v2rayN 已启动**（用于 yt-dlp 通过代理访问 YouTube），且代理端口与 `config.yaml` 中 `proxy` 配置一致。
-
-### 方式二：命令行手动运行
-
-```powershell
-cd e:\DevProject\YT_BI_Anti
-python main.py
 ```
-
----
-
-> [!NOTE]
-> **未来若要切换为定时自动执行（Linux 服务器）**，只需将 `.py` 源文件、`config.yaml`、`cookies.json` 和 `history.json` 复制到服务器，安装相同依赖，然后用 crontab 触发：
-> ```cron
-> 0 */12 * * * cd /opt/YT_BI_Anti && venv/bin/python main.py >> run.log 2>&1
-> ```
+config.yaml          # 配置文件
+cookies.json         # B站登录 Cookie
+history.json         # 已上传视频 ID 列表
+data/
+  scan_cache.json    # 扫描元数据缓存（7天TTL）
+  upload_meta.json   # 上传队列（持久化）
+  <title>_<vid8>/    # 每个视频的工作目录
+    *.mp4            # 下载的视频
+    *.webp           # 缩略图
+    *.zh-Hans.vtt    # 中文字幕（VTT）
+    *.zh-Hans.srt    # 转换后的字幕（SRT）
+    *_final.mp4      # 转码后的最终视频
+    cover_custom.jpg # 生成的封面
+```
