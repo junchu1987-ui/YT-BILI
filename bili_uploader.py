@@ -14,7 +14,7 @@ class BilibiliUploader:
         self.cookie_file = 'cookies.json'
         self.cover_proc = CoverProcessor(config)
 
-    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None):
+    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None, desc_override=None):
         """
         Uploads a video to Bilibili using biliup's internal Python API (no CLI).
         """
@@ -23,18 +23,32 @@ class BilibiliUploader:
 
         # Step 1: AI Title & Description Translation
         bili_title = title
-        bili_desc = ""
         try:
             if title_already_translated:
                 logger.info(f"Title already translated, skipping: {title}")
             else:
-                logger.info(f"Translating meta (title & description)...")
+                logger.info(f"Translating title...")
                 bili_title = self.cover_proc.translate_title(title)
-            if original_description:
-                bili_desc = self.cover_proc.translate_description(original_description)
             logger.info(f"Final Bilibili Title: {bili_title}")
         except Exception as e:
-            logger.error(f"Meta translation failed: {e}")
+            logger.error(f"Title translation failed: {e}")
+
+        # Description: use pre-processed value from meta if available, else translate now
+        if desc_override is not None:
+            final_description = desc_override
+            logger.info(f"Using pre-translated description ({len(final_description)} chars)")
+        else:
+            desc_prefix = self.config['bilibili'].get('desc_prefix', '')
+            try:
+                if original_description:
+                    raw_desc = self.cover_proc.translate_description(original_description)
+                else:
+                    raw_desc = ''
+            except Exception as e:
+                logger.error(f"Description translation failed: {e}")
+                raw_desc = original_description or ''
+            final_description = f"{raw_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
+            final_description = final_description[:2000]
 
         # Ensure absolute path for video
         file_path = os.path.abspath(file_path)
@@ -54,8 +68,6 @@ class BilibiliUploader:
                 cover_path = os.path.abspath(original_thumbnail)
 
         tid = tid_override if tid_override is not None else self.config['bilibili'].get('tid', 171)
-        desc_prefix = self.config['bilibili'].get('desc_prefix', '')
-        final_description = f"{bili_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
         tags = tags_override if tags_override is not None else []
 
         copyright_val = copyright_override if copyright_override in (1, 2) else 1

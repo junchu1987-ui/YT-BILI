@@ -208,6 +208,8 @@ function renderActionPanel(sm) {
       <div class="action-footer">
         <button class="btn btn-primary" onclick="doDownload()" ${newCnt===0?'disabled':''}>⬇ 开始下载</button>
         <button class="btn btn-ghost" onclick="doScan()">重新扫描</button>
+        <label class="auto-transcode-label"><input type="checkbox" id="chk-auto-transcode"> 下载后自动转码</label>
+        <label class="auto-transcode-label"><input type="checkbox" id="chk-subtitles" checked> 下载字幕</label>
       </div>`;
 
   } else if (status === 'downloading') {
@@ -431,7 +433,7 @@ function renderVideoSection() {
     itemRow.className = 'video-item' + (isSkip ? ' skipped' : '') + (errEntry ? ' error' : '') + (isUploaded ? ' done' : '');
     itemRow.id = 'vi-' + c.id;
 
-    const thumbUrl = `https://i.ytimg.com/vi/${c.id}/mqdefault.jpg`;
+    const thumbUrl = `/api/thumb/${c.id}`;
     const showFmtToggle = showCheckbox && !isSkip && c.formats && c.formats.length;
     const expanded = !!S.formatsExpanded[c.id];
     const selectedLabel = S.selectedFormats[c.id]
@@ -453,7 +455,7 @@ function renderVideoSection() {
     itemRow.innerHTML = `
       ${isDraggable ? '<div class="drag-handle">⠿</div>' : ''}
       ${chk}
-      <img class="video-thumb" src="${thumbUrl}" alt="" loading="lazy">
+      <img class="video-thumb" src="${thumbUrl}" alt="" loading="lazy" onerror="this.style.visibility='hidden'">
       <div class="video-info">
         <div class="video-title" title="${escHtml(displayTitle)}">${escHtml(displayTitle)}</div>
         ${showOrigTitle ? `<div class="video-orig-title" title="${escHtml(c.title)}">${escHtml(c.title)}</div>` : ''}
@@ -570,8 +572,13 @@ function renderVideoSection() {
                 tags: [...S.defaultTags],
                 schedule_time: null,
                 copyright: 1,
-                source: c.url || ''
+                source: c.url || '',
+                desc: ''
             };
+        }
+        // Backfill desc from server-pushed upload_meta if not yet set locally
+        if (S.uploadMeta[c.id].desc === undefined) {
+            S.uploadMeta[c.id].desc = '';
         }
         // Ensure tags is always an array
         if (!Array.isArray(S.uploadMeta[c.id].tags)) {
@@ -637,6 +644,11 @@ function renderVideoSection() {
                 <span class="schedule-hint">⚠ 需距现在4小时以上</span>
               </div>
             </div>
+          </div>
+          <div class="meta-field full-row">
+            <label>简介</label>
+            <textarea class="meta-desc" rows="5" maxlength="2000" placeholder="B站简介（最多2000字）">${escHtml(m.desc || '')}</textarea>
+            <div class="desc-counter"><span class="desc-len">${(m.desc||'').length}</span>/2000</div>
           </div>`;
         // Set select value after insertion
         editor.querySelector('.meta-tid').value = m.tid;
@@ -696,6 +708,11 @@ function renderVideoSection() {
             S.uploadMeta[c.id].schedule_time = e.target.value || null;
             scheduleMetaSave(c.id);
         });
+        editor.querySelector('.meta-desc').addEventListener('input', e => {
+            S.uploadMeta[c.id].desc = e.target.value;
+            editor.querySelector('.desc-len').textContent = e.target.value.length;
+            scheduleMetaSave(c.id);
+        });
         // Meta toggle button event
         const metaToggle = itemRow.querySelector('.btn-meta-toggle');
         if (metaToggle) {
@@ -751,7 +768,9 @@ async function doScan() { selectedIds.clear(); await api('POST', '/api/scan'); }
 async function doDownload() {
   const ids = [...selectedIds];
   if (!ids.length) { alert('请至少选择一个视频'); return; }
-  
+  const autoTranscode = document.getElementById('chk-auto-transcode')?.checked || false;
+  const withSubtitles = document.getElementById('chk-subtitles')?.checked ?? true;
+
   const payload = ids.map(id => {
     const selFormats = S.selectedFormats[id];
     let format_id = null;
@@ -766,7 +785,7 @@ async function doDownload() {
     return { id: id, format_id: format_id, quality: 'custom' };
   });
   
-  await api('POST', '/api/download', { video_ids: payload });
+  await api('POST', '/api/download', { video_ids: payload, auto_transcode: autoTranscode, with_subtitles: withSubtitles });
 }
 async function doTranscode() { await api('POST', '/api/transcode'); }
 async function doUpload() {

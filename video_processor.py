@@ -124,6 +124,109 @@ class VideoProcessor:
             raise Exception(f"FFmpeg failed (code {proc.returncode}). Last output:\n{last_msg}")
         return True
 
+    def _vtt_to_srt(self, vtt_path):
+        """Parse YouTube rolling VTT and produce clean single-line SRT."""
+        srt_path = re.sub(r'\.vtt$', '.srt', vtt_path, flags=re.IGNORECASE)
+
+        def ts_to_ms(ts):
+            ts = ts.replace('.', ',')
+            h, m, s = ts.split(':')
+            s, ms = s.split(',')
+            return int(h)*3600000 + int(m)*60000 + int(s)*1000 + int(ms)
+
+        def ms_to_ts(ms):
+            h = ms // 3600000; ms %= 3600000
+            m = ms // 60000;   ms %= 60000
+            s = ms // 1000;    ms %= 1000
+            return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+        def strip_cue_tags(text):
+            """Remove VTT word-level timing tags like <00:00:01.000><c>word</c>"""
+            text = re.sub(r'<\d{2}:\d{2}:\d{2}\.\d+>', '', text)
+            text = re.sub(r'</?c>', '', text)
+            return text.strip()
+
+        with open(vtt_path, encoding='utf-8', errors='replace') as f:
+            content = f.read()
+
+        entries = []
+        for block in re.split(r'\n\n+', content.strip()):
+            lines = block.strip().splitlines()
+            if len(lines) < 2:
+                continue
+            # Find timestamp line
+            ts_line = None
+            text_lines = []
+            for line in lines:
+                if '-->' in line and ts_line is None:
+                    ts_line = line
+                elif ts_line is not None:
+                    text_lines.append(line)
+            if not ts_line:
+                continue
+            m = re.match(r'([\d:\.]+)\s*-->\s*([\d:\.]+)', ts_line)
+            if not m:
+                continue
+            start_ms = ts_to_ms(m.group(1))
+            end_ms = ts_to_ms(m.group(2))
+            if end_ms - start_ms < 200:
+                continue
+
+            # Strip cue tags from all text lines, keep non-empty
+            clean_lines = [strip_cue_tags(l) for l in text_lines]
+            clean_lines = [l for l in clean_lines if l]
+            if not clean_lines:
+                continue
+
+            # YouTube rolling subtitle structure:
+            # Line 1 = previous sentence (already complete)
+            # Line 2 = current sentence being spoken (with cue tags)
+            # We want line 2 (the new content). If only one line, use it.
+            if len(clean_lines) >= 2:
+                text = clean_lines[1]  # current sentence
+            else:
+                text = clean_lines[0]
+
+            if not text:
+                continue
+            entries.append((start_ms, end_ms, text))
+
+        # Merge consecutive entries with identical text
+        merged = []
+        for start, end, text in entries:
+            if merged and merged[-1][2] == text:
+                merged[-1][1] = end
+            else:
+                merged.append([start, end, text])
+
+        # Merge entries that are very close in time (gap < 300ms) and form natural sentences
+        # i.e. previous entry doesn't end with sentence-final punctuation
+        sentence_end = re.compile(r'[。！？…]$')
+        joined = []
+        for start, end, text in merged:
+            if (joined and not sentence_end.search(joined[-1][2])
+                    and start - joined[-1][1] < 300):
+                joined[-1][1] = end
+                joined[-1][2] += text
+            else:
+                joined.append([start, end, text])
+
+        with open(srt_path, 'w', encoding='utf-8') as f:
+            for i, (start, end, text) in enumerate(joined, 1):
+                f.write(f"{i}\n{ms_to_ts(start)} --> {ms_to_ts(end)}\n{text}\n\n")
+
+        return srt_path
+
+    def _sub_filter(self, srt_path, margin_v, font_size, colour):
+        """Build a subtitles= filter string with force_style for a given SRT file."""
+        # ffmpeg subtitles filter on Windows needs forward slashes and escaped colons
+        safe_path = srt_path.replace('\\', '/').replace(':', '\\:')
+        style = (f"PlayResX=1920,PlayResY=1080,Alignment=2,MarginV={margin_v},"
+                 f"FontSize={font_size},PrimaryColour={colour},"
+                 f"OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=0,"
+                 f"WrapStyle=1")
+        return f"subtitles='{safe_path}':force_style='{style}'"
+
     def process(self, video_data, cancel_check=None, progress_cb=None):
         """
         Seamless GPU Strategy (Hybrid):
@@ -168,7 +271,11 @@ class VideoProcessor:
         if not os.path.exists(matched_intro):
             logging.info(f"GPU Pre-aligner: Matching intro to {m['width']}x{m['height']} @ {fps_val:.3f}fps")
 
-            vf_str = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
+            vw, vh = m['width'], m['height']
+            # Round to even dimensions for encoder compatibility (yuv420p requires even w/h)
+            vw = vw if vw % 2 == 0 else vw - 1
+            vh = vh if vh % 2 == 0 else vh - 1
+            vf_str = f"scale={vw}:{vh}:force_original_aspect_ratio=decrease,pad={vw}:{vh}:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
 
             cmd_intro = [
                 self.ffmpeg_path, '-y',
@@ -195,15 +302,39 @@ class VideoProcessor:
         merge_enc = v_enc if use_qsv else v_enc
         logging.info(f"Merging with {merge_enc} (fps={fps_val:.3f})")
 
-        normalize = "scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,format=yuv420p"
-        filter_str = f"[0:v]{normalize}[v0];[1:v]{normalize}[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]"
+        # Intro has already been pre-scaled to match main video dimensions.
+        # Normalize SAR to 1:1 on both streams before concat (SAR mismatch causes -22).
+        filter_str = "[0:v]format=yuv420p,setsar=1[v0];[1:v]format=yuv420p,setsar=1[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]"
+
+        # Build subtitle burn-in chain (appended after concat)
+        sub_filters = []
+        for vtt_key, margin_v, font_size, colour in [
+            ('subtitle_zh', 20, 28, '&H00FFFFFF&'),   # 中文：白色，底部贴边
+        ]:
+            vtt_path = video_data.get(vtt_key, '')
+            if vtt_path and os.path.isfile(vtt_path):
+                srt_path = self._vtt_to_srt(vtt_path)
+                if srt_path:
+                    sub_filters.append(self._sub_filter(srt_path, margin_v, font_size, colour))
+                    logging.info(f"Subtitle burn-in: {vtt_key} -> {srt_path}")
+
+        if sub_filters:
+            # Chain subtitle filters after concat: [outv] → sub1 → sub2 → [outv_final]
+            chain = '[outv]'
+            for i, sf in enumerate(sub_filters):
+                out_tag = '[outv_final]' if i == len(sub_filters) - 1 else f'[vsub{i}]'
+                filter_str += f';{chain}{sf}{out_tag}'
+                chain = out_tag
+            video_out_tag = '[outv_final]'
+        else:
+            video_out_tag = '[outv]'
         fps_frac = m['fps']  # e.g. "60000/1001" or "30/1"
         if use_qsv:
             cmd_merge = [
                 self.ffmpeg_path, '-y',
                 '-i', matched_intro, '-i', filepath,
                 '-filter_complex', filter_str,
-                '-map', '[outv]', '-map', '[outa]',
+                '-map', video_out_tag, '-map', '[outa]',
                 '-r', fps_frac,
                 '-c:v', merge_enc, '-global_quality', '25',
                 '-c:a', 'aac', '-b:a', a_bitrate,
@@ -214,7 +345,7 @@ class VideoProcessor:
                 self.ffmpeg_path, '-y',
                 '-i', matched_intro, '-i', filepath,
                 '-filter_complex', filter_str,
-                '-map', '[outv]', '-map', '[outa]',
+                '-map', video_out_tag, '-map', '[outa]',
                 '-c:v', merge_enc, '-preset', 'medium', '-crf', '23',
                 '-c:a', 'aac', '-b:a', a_bitrate,
                 final_output
@@ -225,12 +356,23 @@ class VideoProcessor:
             return final_output
         except Exception as e:
             logging.error(f"GPU merge failed: {e}. Falling back to libx264...")
+            # Rebuild filter without subtitle on fallback to isolate the issue
+            filter_fb = "[0:v]format=yuv420p,setsar=1[v0];[1:v]format=yuv420p,setsar=1[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]"
+            if sub_filters:
+                chain = '[outv]'
+                for i, sf in enumerate(sub_filters):
+                    out_tag = '[outv_final]' if i == len(sub_filters) - 1 else f'[vsub{i}]'
+                    filter_fb += f';{chain}{sf}{out_tag}'
+                    chain = out_tag
+                fb_video_out = '[outv_final]'
+            else:
+                fb_video_out = '[outv]'
             cmd_fb = [
                 self.ffmpeg_path, '-y',
                 '-i', matched_intro,
                 '-i', filepath,
-                '-filter_complex', f"[0:v]{normalize}[v0];[1:v]{normalize}[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]",
-                '-map', '[outv]', '-map', '[outa]',
+                '-filter_complex', filter_fb,
+                '-map', fb_video_out, '-map', '[outa]',
                 '-c:v', 'libx264', '-preset', 'fast', '-crf', '23',
                 '-c:a', 'aac', '-b:a', a_bitrate,
                 final_output

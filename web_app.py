@@ -3,6 +3,7 @@ import sys
 import yaml
 import json
 import logging
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -325,15 +326,22 @@ def run_scan():
                             # Sort formats: combined first, then resolution desc
                             all_formats.sort(key=lambda x: (x['vcodec'] != 'none' and x['acodec'] != 'none', x['resolution']), reverse=True)
 
-                            # Pick recommended format pair:
-                            # Best video: h264 <= 1080p; fallback to any codec <= 1080p
-                            # Best audio: m4a/mp4a; fallback to any audio-only
+                            # Pick recommended format:
+                            # Prefer a combined (video+audio) format at <=1080p to avoid merging.
+                            # Fall back to separate best_video + best_audio if no good combo exists.
                             video_formats = [f for f in all_formats if f['acodec'] == 'none' and f['vcodec'] != 'none']
                             audio_formats = [f for f in all_formats if f['vcodec'] == 'none' and f['acodec'] != 'none']
+                            combo_formats = [f for f in all_formats if f['acodec'] != 'none' and f['vcodec'] != 'none']
 
                             def res_height(f):
                                 try: return int(f['resolution'].split('x')[1])
                                 except: return 0
+
+                            # Best combined format <= 1080p (no separate audio track needed)
+                            combo_1080 = [f for f in combo_formats if res_height(f) <= 1080]
+                            best_combo = (
+                                sorted(combo_1080, key=res_height, reverse=True)[0] if combo_1080 else None
+                            )
 
                             vid_1080 = [f for f in video_formats if res_height(f) <= 1080]
                             h264_candidates = [f for f in vid_1080 if 'avc' in f['vcodec']]
@@ -349,14 +357,27 @@ def run_scan():
                                 None
                             )
 
+                            # Use combo if it matches the quality of best_video; otherwise separate
+                            use_combo = (
+                                best_combo and (
+                                    best_video is None or
+                                    res_height(best_combo) >= res_height(best_video)
+                                )
+                            )
+
                             recommended_ids = set()
-                            if best_video: recommended_ids.add(best_video['format_id'])
-                            if best_audio: recommended_ids.add(best_audio['format_id'])
+                            if use_combo:
+                                recommended_ids.add(best_combo['format_id'])
+                            else:
+                                if best_video: recommended_ids.add(best_video['format_id'])
+                                if best_audio: recommended_ids.add(best_audio['format_id'])
                             for f in all_formats:
                                 f['recommended'] = f['format_id'] in recommended_ids
 
                             rec_format_id = None
-                            if best_video and best_audio:
+                            if use_combo:
+                                rec_format_id = best_combo['format_id']
+                            elif best_video and best_audio:
                                 rec_format_id = f"{best_video['format_id']}+{best_audio['format_id']}"
                             elif best_video:
                                 rec_format_id = best_video['format_id']
@@ -401,7 +422,93 @@ def run_scan():
         log_to_web('error', f"扫描阶段崩溃: {str(e)}")
         update_state('idle')
 
-def run_download(video_ids):
+def _ensure_audio(video_path, vid_dir, vid, candidate, cfg):
+    """
+    Check if video_path has an audio track via ffprobe.
+    If not: find an m4a/aac file in vid_dir, or download best audio, then merge.
+    Returns path to the final video file (with audio).
+    """
+    ffprobe = cfg['ffmpeg'].get('bin_path', 'ffmpeg').replace('ffmpeg', 'ffprobe')
+    ffmpeg  = cfg['ffmpeg'].get('bin_path', 'ffmpeg')
+
+    # Check audio streams
+    try:
+        r = subprocess.run(
+            [ffprobe, '-v', 'error', '-select_streams', 'a',
+             '-show_entries', 'stream=codec_type', '-of', 'csv=p=0', video_path],
+            capture_output=True, text=True, timeout=30
+        )
+        has_audio = bool(r.stdout.strip())
+    except Exception as e:
+        logging.warning(f"[{vid}] ffprobe audio check failed: {e}")
+        return video_path
+
+    if has_audio:
+        logging.info(f"[{vid}] Audio track present, no merge needed.")
+        return video_path
+
+    logging.info(f"[{vid}] No audio track found, looking for audio file to merge...")
+
+    # Find existing m4a/aac in directory
+    audio_file = None
+    for f in os.listdir(vid_dir):
+        if f.lower().endswith(('.m4a', '.aac', '.opus', '.webm')) and os.path.getsize(os.path.join(vid_dir, f)) > 10240:
+            audio_file = os.path.join(vid_dir, f)
+            logging.info(f"[{vid}] Found existing audio: {f}")
+            break
+
+    # If not found, download best audio
+    if not audio_file:
+        logging.info(f"[{vid}] Downloading best audio track...")
+        audio_out = os.path.join(vid_dir, f"{vid}_audio.%(ext)s")
+        try:
+            from yt_dlp import YoutubeDL
+            audio_opts = {
+                'format': 'bestaudio[ext=m4a]/bestaudio',
+                'outtmpl': audio_out,
+                'quiet': True,
+                'no_warnings': True,
+                'proxy': cfg['app'].get('proxy'),
+                'cookiefile': 'youtube_cookies.txt',
+                'ffmpeg_location': ffmpeg,
+            }
+            with YoutubeDL(audio_opts) as ydl:
+                ydl.download([f"https://www.youtube.com/watch?v={vid}"])
+            # Find what was written
+            for f in os.listdir(vid_dir):
+                if f.startswith(f"{vid}_audio") and os.path.getsize(os.path.join(vid_dir, f)) > 10240:
+                    audio_file = os.path.join(vid_dir, f)
+                    break
+        except Exception as e:
+            logging.error(f"[{vid}] Audio download failed: {e}")
+            return video_path
+
+    if not audio_file:
+        logging.error(f"[{vid}] Could not obtain audio file, skipping merge.")
+        return video_path
+
+    # Merge video + audio
+    merged = video_path.rsplit('.', 1)[0] + '_merged.mp4'
+    try:
+        r = subprocess.run(
+            [ffmpeg, '-y', '-i', video_path, '-i', audio_file,
+             '-c:v', 'copy', '-c:a', 'aac', '-shortest', merged],
+            capture_output=True, text=True, timeout=600
+        )
+        if r.returncode == 0 and os.path.getsize(merged) > 0:
+            os.replace(merged, video_path)
+            logging.info(f"[{vid}] Audio merged successfully.")
+        else:
+            logging.error(f"[{vid}] Merge failed: {r.stderr[-300:]}")
+            if os.path.exists(merged):
+                os.remove(merged)
+    except Exception as e:
+        logging.error(f"[{vid}] Merge exception: {e}")
+
+    return video_path
+
+
+def run_download(video_ids, auto_transcode=False, with_subtitles=True):
     try:
         update_state('downloading')
         cfg = load_config()
@@ -456,16 +563,33 @@ def run_download(video_ids):
                 'proxy': cfg['app'].get('proxy'),
                 'quiet': True,
                 'no_warnings': True,
+                'ignoreerrors': True,
+                'cookiefile': 'youtube_cookies.txt',
                 'merge_output_format': 'mp4',
                 'writethumbnail': True,
                 'ffmpeg_location': cfg['ffmpeg'].get('bin_path'),
                 'js_runtimes': _js_runtimes(),
             }
+            if with_subtitles:
+                ydl_opts.update({
+                    'writesubtitles': True,
+                    'writeautomaticsub': True,
+                    'subtitleslangs': ['zh-Hans'],
+                    'subtitlesformat': 'vtt',
+                })
 
             try:
-                with YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([c['url']])
-                
+                try:
+                    with YoutubeDL(ydl_opts) as ydl:
+                        ydl.download([c['url']])
+                except Exception as ydl_err:
+                    err_str = str(ydl_err)
+                    # Subtitle-only errors (429, unavailable) — video may still be downloaded OK
+                    if 'subtitle' in err_str.lower():
+                        log_to_web('warning', f"字幕下载失败（已跳过）: {err_str}", vid)
+                    else:
+                        raise  # Re-raise real download errors
+
                 # Phase 3: Flexible Verify and Map
                 # First try the expected filename, then fall back to largest video file
                 found_video = None
@@ -488,12 +612,45 @@ def run_download(video_ids):
                     c['local_path'] = found_video
                     c['local_dir'] = vid_dir
 
-                    # Check for thumbnail (might be .jpg, .png, .webp)
-                    # Look for any image file in the directory
+                    # Phase 3b: Verify audio track exists; merge if missing
+                    found_video = _ensure_audio(found_video, vid_dir, vid, c, cfg)
+                    c['local_path'] = found_video
+
+                    # Check for thumbnail and subtitles
                     for f in os.listdir(vid_dir):
-                        if f.lower().endswith(('.jpg', '.png', '.webp', '.jpeg')):
+                        if f.lower().endswith(('.jpg', '.png', '.webp', '.jpeg')) and 'original_thumbnail' not in c:
                             c['original_thumbnail'] = os.path.join(vid_dir, f)
-                            break
+                        elif f.endswith('.zh-Hans.vtt') or f.endswith('.zh-Hans.ass'):
+                            c['subtitle_zh'] = os.path.join(vid_dir, f)
+
+                    # If subtitle missing (e.g. was 429'd during main download), retry subtitle-only
+                    if with_subtitles and not c.get('subtitle_zh'):
+                        log_to_web('info', f"字幕未找到，尝试单独补下...", vid)
+                        sub_opts = {
+                            'skip_download': True,
+                            'outtmpl': out_tmpl,
+                            'proxy': cfg['app'].get('proxy'),
+                            'quiet': True,
+                            'no_warnings': True,
+                            'cookiefile': 'youtube_cookies.txt',
+                            'writesubtitles': True,
+                            'writeautomaticsub': True,
+                            'subtitleslangs': ['zh-Hans'],
+                            'subtitlesformat': 'vtt',
+                            'ffmpeg_location': cfg['ffmpeg'].get('bin_path'),
+                            'js_runtimes': _js_runtimes(),
+                        }
+                        try:
+                            with YoutubeDL(sub_opts) as ydl:
+                                ydl.download([c['url']])
+                            # Re-scan for subtitle after retry
+                            for f in os.listdir(vid_dir):
+                                if f.endswith('.zh-Hans.vtt') or f.endswith('.zh-Hans.ass'):
+                                    c['subtitle_zh'] = os.path.join(vid_dir, f)
+                                    log_to_web('info', f"补下字幕成功: {f}", vid)
+                                    break
+                        except Exception as sub_err:
+                            log_to_web('warning', f"字幕补下失败（跳过）: {sub_err}", vid)
 
                     with state_lock:
                         S['downloaded'].append(c)
@@ -509,6 +666,9 @@ def run_download(video_ids):
                 log_to_web('error', f"下载失败: {str(e)}", vid)
 
         update_state('download_done')
+        if auto_transcode and S['downloaded']:
+            log_to_web('info', '下载完成，自动开始转码...')
+            run_transcode()
     except Exception as e:
         log_to_web('error', f"下载阶段崩溃: {str(e)}")
         update_state('scan_done')
@@ -530,7 +690,8 @@ def run_transcode():
             vid_dir_name = f"{safe_title}_{vid[:8]}"
             video_data = {
                 'id': vid,
-                'filepath': os.path.join(cfg['app']['work_dir'], vid_dir_name, f"{safe_title}.mp4")
+                'filepath': c.get('local_path') or os.path.join(cfg['app']['work_dir'], vid_dir_name, f"{safe_title}.mp4"),
+                'subtitle_zh': c.get('subtitle_zh', ''),
             }
 
             def transcode_progress(pct):
@@ -569,6 +730,7 @@ def run_translate(vids=None):
         cover_proc = CoverProcessor(cfg)
 
         targets = [c for c in S['transcoded'] if vids is None or c['id'] in vids]
+        desc_prefix = cfg['bilibili'].get('desc_prefix', '')
         for c in targets:
             if S['cancel_flag']: break
             vid = c['id']
@@ -589,6 +751,32 @@ def run_translate(vids=None):
                     log_to_web('warn', f"翻译结果为空或与原文相同，跳过", vid)
             except Exception as e:
                 log_to_web('error', f"翻译失败: {e}", vid)
+
+            # 翻译简介并截断至 Bilibili 2000 字上限
+            log_to_web('info', f"翻译简介...", vid)
+            try:
+                original_desc = c.get('description', '')
+                source_url = c.get('url', '')
+                if original_desc:
+                    try:
+                        translated_desc = cover_proc.translate_description(original_desc)
+                    except Exception as e:
+                        log_to_web('warn', f"简介翻译失败，使用原文: {e}", vid)
+                        translated_desc = original_desc
+                    final_desc = f"{translated_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
+                else:
+                    final_desc = desc_prefix.replace('{youtube_url}', source_url)
+                final_desc = final_desc[:2000]
+                meta = _load_upload_meta(work_dir)
+                if vid in meta:
+                    meta[vid]['desc'] = final_desc
+                    _save_upload_meta(work_dir, meta)
+                with state_lock:
+                    if vid in S['upload_meta']:
+                        S['upload_meta'][vid]['desc'] = final_desc
+                log_to_web('info', f"简介处理完成 ({len(final_desc)} 字)", vid)
+            except Exception as e:
+                log_to_web('error', f"简介处理失败: {e}", vid)
 
         update_state('translate_done')
     except Exception as e:
@@ -616,6 +804,7 @@ def _do_upload_single(vid, c, uploader, cfg):
             log_to_web('warn', f"无法解析定时时间 '{schedule_time_str}': {e}", vid)
     copyright_override = int(meta['copyright']) if meta.get('copyright') in (1, 2, '1', '2') else None
     source_override = meta.get('source') or None
+    desc_override = meta.get('desc') or None
 
     file_path = meta.get('local_path') or ''
     if not file_path or not os.path.isfile(file_path):
@@ -646,7 +835,8 @@ def _do_upload_single(vid, c, uploader, cfg):
         dtime_override=dtime_override,
         title_already_translated='translated_title' in c,
         copyright_override=copyright_override,
-        source_override=source_override
+        source_override=source_override,
+        desc_override=desc_override
     )
     if res:
         with state_lock:
@@ -734,11 +924,13 @@ def trigger_scan():
 def trigger_download():
     data = request.json or {}
     video_ids = data.get('video_ids', []) # Expected list of {id, quality}
+    auto_transcode = bool(data.get('auto_transcode', False))
+    with_subtitles = bool(data.get('with_subtitles', True))
     if not video_ids: return jsonify({'error': 'No IDs provided'}), 400
     with state_lock:
         if S['status'] != 'scan_done': return jsonify({'error': 'Wrong state'}), 400
         S['cancel_flag'] = False
-        S['current_task'] = threading.Thread(target=run_download, args=(video_ids,))
+        S['current_task'] = threading.Thread(target=run_download, args=(video_ids, auto_transcode, with_subtitles))
         S['current_task'].start()
     return jsonify({'ok': True})
 
@@ -758,7 +950,7 @@ def save_upload_meta():
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
     # Merge into persistent file — only update editable fields, preserve uploaded/local_path etc.
-    EDITABLE = {'title', 'tid', 'tags', 'copyright', 'source', 'schedule_time'}
+    EDITABLE = {'title', 'tid', 'tags', 'copyright', 'source', 'schedule_time', 'desc'}
     disk_meta = _load_upload_meta(work_dir)
     for vid, fields in incoming.items():
         if vid in disk_meta:
@@ -800,6 +992,10 @@ def mark_upload_done(vid):
         meta[vid]['uploaded'] = True
         meta[vid]['uploaded_at'] = int(time.time())
         _save_upload_meta(work_dir, meta)
+    add_history(vid)
+    with state_lock:
+        S['upload_meta'].pop(vid, None)
+        S['transcoded'] = [x for x in S['transcoded'] if x['id'] != vid]
     update_state()
     return jsonify({'ok': True})
 
@@ -1157,19 +1353,43 @@ def get_thumb(vid):
     from flask import send_file
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
+    app_root = os.path.dirname(os.path.abspath(__file__))
+
+    def resolve(path):
+        if not os.path.isabs(path):
+            path = os.path.normpath(os.path.join(app_root, path))
+        return path if os.path.isfile(path) else None
+
+    # 1. Check upload_meta.json first (most reliable)
     meta = _load_upload_meta(work_dir)
     m = meta.get(vid)
-    if not m:
-        return '', 404
-    thumb_path = m.get('original_thumbnail', '')
-    if not thumb_path:
-        return '', 404
-    # Normalize path relative to app root (not work_dir — thumbnail already starts with ./data/...)
-    if not os.path.isabs(thumb_path):
-        thumb_path = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), thumb_path))
-    if not os.path.isfile(thumb_path):
-        return '', 404
-    return send_file(thumb_path)
+    if m:
+        p = resolve(m.get('original_thumbnail', ''))
+        if p:
+            return send_file(p)
+
+    # 2. Search data/ directory for any image starting with vid prefix
+    if os.path.isdir(work_dir):
+        for entry in os.scandir(work_dir):
+            if not entry.is_dir():
+                continue
+            # Match directories ending with _<vid8> (first 8 chars of vid)
+            if not entry.name.endswith('_' + vid[:8]):
+                continue
+            for ext in ('webp', 'jpg', 'jpeg', 'png'):
+                # Thumbnail filename = slugified title (same as dir name minus _vid8 suffix)
+                stem = entry.name[: -(len(vid[:8]) + 1)]
+                candidate = os.path.join(entry.path, stem + '.' + ext)
+                if os.path.isfile(candidate):
+                    return send_file(candidate)
+            # Fallback: any image in that dir (cover_custom excluded)
+            for fname in os.listdir(entry.path):
+                if fname == 'cover_custom.jpg':
+                    continue
+                if fname.lower().endswith(('.webp', '.jpg', '.jpeg', '.png')):
+                    return send_file(os.path.join(entry.path, fname))
+
+    return '', 404
 
 # ── Bilibili status (sidebar) ─────────────────────────────────────────────────
 @app.route('/api/bilibili/status', methods=['GET'])

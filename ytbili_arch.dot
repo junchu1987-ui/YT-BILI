@@ -1,0 +1,211 @@
+digraph YTBILI_Architecture {
+    graph [
+        label="YT-BILI 架构图\n（YouTube → Bilibili 自动搬运工具）"
+        labelloc=t
+        labeljust=c
+        fontname="Microsoft YaHei"
+        fontsize=18
+        fontcolor="#1a1a2e"
+        bgcolor="#fafafa"
+        rankdir=TB
+        splines=spline
+        nodesep=0.6
+        ranksep=0.9
+        pad=0.5
+        compound=true
+    ]
+    node [fontname="Microsoft YaHei" fontsize=11]
+    edge [fontname="Microsoft YaHei" fontsize=9]
+
+    // ── 用户 ───────────────────────────────────────────────────────────
+    user [
+        label="用户\n(Browser)"
+        shape=circle
+        style="filled"
+        fillcolor="#4a90d9"
+        fontcolor=white
+        fontsize=12
+        width=1.0
+    ]
+
+    // ── 前端 ──────────────────────────────────────────────────────────
+    subgraph cluster_frontend {
+        label="前端 (static/)"
+        style="filled,rounded"
+        fillcolor="#e8f4f8"
+        color="#4a90d9"
+        fontname="Microsoft YaHei"
+        fontsize=12
+        fontcolor="#1a1a2e"
+
+        appjs  [label="app.js\n(主 UI 逻辑)" shape=box style="rounded,filled" fillcolor="#b3d9f2"]
+        stylecss [label="style.css\n(样式)" shape=box style="rounded,filled" fillcolor="#b3d9f2"]
+        tmpl   [label="templates/index.html\n(Jinja2 模板)" shape=box style="rounded,filled" fillcolor="#b3d9f2"]
+    }
+
+    // ── Web 服务层 ────────────────────────────────────────────────────
+    subgraph cluster_webapp {
+        label="Web 服务层 (web_app.py / Flask)"
+        style="filled,rounded"
+        fillcolor="#e8f2e8"
+        color="#4caf50"
+        fontname="Microsoft YaHei"
+        fontsize=12
+        fontcolor="#1a1a2e"
+
+        flask   [label="Flask App\n(路由 & 全局状态 S)" shape=box style="rounded,filled" fillcolor="#a5d6a7"]
+        sse     [label="SSE 事件流\n/events" shape=box style="rounded,filled" fillcolor="#a5d6a7"]
+        api     [label="REST API\n/api/scan /api/download\n/api/transcode /api/translate\n/api/upload /api/config\n/api/sources /api/upload_meta" shape=box style="rounded,filled" fillcolor="#a5d6a7"]
+        state   [label="内存状态机\nS = {status, candidates,\ndownloaded, transcoded,\nuploaded, upload_meta, ...}" shape=box style="rounded,filled" fillcolor="#c8e6c9" fontsize=10]
+    }
+
+    // ── Pipeline 核心 ─────────────────────────────────────────────────
+    subgraph cluster_pipeline {
+        label="Pipeline 流水线（后台线程）"
+        style="filled,rounded"
+        fillcolor="#fff8e1"
+        color="#ff9800"
+        fontname="Microsoft YaHei"
+        fontsize=12
+        fontcolor="#1a1a2e"
+
+        scan      [label="1. run_scan\n扫描 YouTube 源\n(yt-dlp + scan_cache.json)" shape=box style="rounded,filled" fillcolor="#ffe082"]
+        download  [label="2. run_download\n下载视频 + 字幕 + 缩略图\n(yt-dlp + FFmpeg 合流)" shape=box style="rounded,filled" fillcolor="#ffe082"]
+        transcode [label="3. run_transcode\n添加片头 + 烧录字幕\n(VideoProcessor + GPU/CPU)" shape=box style="rounded,filled" fillcolor="#ffe082"]
+        translate [label="4. run_translate\n翻译标题 & 简介\n(CoverProcessor → GLM-4-Flash)" shape=box style="rounded,filled" fillcolor="#ffe082"]
+        upload    [label="5. run_upload\n生成封面 + 投递 Bilibili\n(BilibiliUploader)" shape=box style="rounded,filled" fillcolor="#ffe082"]
+    }
+
+    // ── 功能模块 ──────────────────────────────────────────────────────
+    subgraph cluster_modules {
+        label="功能模块"
+        style="filled,rounded"
+        fillcolor="#f3e5f5"
+        color="#9c27b0"
+        fontname="Microsoft YaHei"
+        fontsize=12
+        fontcolor="#1a1a2e"
+
+        ytdl    [label="yt_downloader.py\nYouTubeDownloader\n(URL 类型检测 / 历史去重)" shape=box style="rounded,filled" fillcolor="#ce93d8"]
+        vproc   [label="video_processor.py\nVideoProcessor\n(HW 探针 / intro 拼接\n字幕烧录 / FFprobe)" shape=box style="rounded,filled" fillcolor="#ce93d8"]
+        cover   [label="cover_processor.py\nCoverProcessor\n(GLM-4-Flash 翻译\n封面图生成 / PIL)" shape=box style="rounded,filled" fillcolor="#ce93d8"]
+        uploader [label="bili_uploader.py\nBilibiliUploader\n(biliup Python API\n封面上传 / 定时投递)" shape=box style="rounded,filled" fillcolor="#ce93d8"]
+    }
+
+    // ── 外部服务 ──────────────────────────────────────────────────────
+    subgraph cluster_external {
+        label="外部服务"
+        style="filled,rounded"
+        fillcolor="#fce4ec"
+        color="#e91e63"
+        fontname="Microsoft YaHei"
+        fontsize=12
+        fontcolor="#1a1a2e"
+
+        youtube  [label="YouTube\n(视频 / 频道 / 播放列表)" shape=cylinder style="filled" fillcolor="#f48fb1"]
+        bilibili [label="Bilibili\n(视频投稿 API)" shape=cylinder style="filled" fillcolor="#f48fb1"]
+        glm      [label="GLM-4-Flash\n(智谱 AI API)" shape=cylinder style="filled" fillcolor="#f48fb1"]
+    }
+
+    // ── 持久化存储 ────────────────────────────────────────────────────
+    subgraph cluster_storage {
+        label="本地持久化"
+        style="filled,rounded"
+        fillcolor="#e0f2f1"
+        color="#009688"
+        fontname="Microsoft YaHei"
+        fontsize=12
+        fontcolor="#1a1a2e"
+
+        config_yaml   [label="config.yaml\n(代理/TID/标签/路径)" shape=note style="filled" fillcolor="#80cbc4"]
+        cookies_json  [label="cookies.json\n(Bilibili 登录态)" shape=note style="filled" fillcolor="#80cbc4"]
+        scan_cache    [label="scan_cache.json\n(视频元数据缓存 7天)" shape=note style="filled" fillcolor="#80cbc4"]
+        upload_meta   [label="upload_meta.json\n(上传队列 + 编辑字段)" shape=note style="filled" fillcolor="#80cbc4"]
+        history_json  [label="history.json\n(已上传 vid 列表)" shape=note style="filled" fillcolor="#80cbc4"]
+        data_dir      [label="data/<title>_<vid8>/\n*.mp4  *.webp  *.vtt\n*_final.mp4" shape=folder style="filled" fillcolor="#b2dfdb"]
+    }
+
+    // ── 系统工具 ──────────────────────────────────────────────────────
+    subgraph cluster_tools {
+        label="本地系统工具"
+        style="filled,rounded"
+        fillcolor="#f5f5f5"
+        color="#757575"
+        fontname="Microsoft YaHei"
+        fontsize=12
+
+        ffmpeg_bin [label="FFmpeg / FFprobe\n(编解码 / 探针)" shape=box style="rounded,filled" fillcolor="#e0e0e0"]
+        ytdlp_bin  [label="yt-dlp\n(下载引擎)" shape=box style="rounded,filled" fillcolor="#e0e0e0"]
+        bun_bin    [label="Bun.js (可选)\n(yt-dlp JS 运行时)" shape=box style="rounded,filled" fillcolor="#e0e0e0"]
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // 边 - 用户 & 前端
+    // ────────────────────────────────────────────────────────────────
+    user -> tmpl    [label="HTTP GET /"]
+    user -> appjs   [style=dashed label="加载 JS/CSS"]
+    appjs -> api    [label="REST 请求" color="#4caf50"]
+    appjs -> sse    [label="SSE 订阅\n实时进度" color="#ff9800" style=dashed]
+    sse   -> appjs  [label="state/log/progress 事件" color="#ff9800" style=dashed]
+
+    // Web 服务内部
+    flask -> api    [style=invis]
+    flask -> sse    [style=invis]
+    flask -> state  [label="读写" color="#4caf50"]
+    api   -> state  [style=invis]
+
+    // API -> Pipeline（异步线程）
+    api -> scan      [label="POST /api/scan" color="#ff9800"]
+    api -> download  [label="POST /api/download" color="#ff9800"]
+    api -> transcode [label="POST /api/transcode" color="#ff9800"]
+    api -> translate [label="POST /api/translate" color="#ff9800"]
+    api -> upload    [label="POST /api/upload" color="#ff9800"]
+
+    // Pipeline 流水线顺序
+    scan -> download  [label="scan_done" color="#ff6f00" style=bold]
+    download -> transcode [label="download_done" color="#ff6f00" style=bold]
+    transcode -> translate [label="transcode_done" color="#ff6f00" style=bold]
+    translate -> upload    [label="translate_done" color="#ff6f00" style=bold]
+
+    // Pipeline -> 功能模块
+    scan      -> ytdl    [color="#9c27b0" style=dashed]
+    download  -> ytdlp_bin [color="#757575" style=dashed]
+    transcode -> vproc   [color="#9c27b0" style=dashed]
+    translate -> cover   [color="#9c27b0" style=dashed]
+    upload    -> uploader [color="#9c27b0" style=dashed]
+
+    // 功能模块 -> 外部服务
+    ytdlp_bin -> youtube  [label="视频/字幕/缩略图" color="#e91e63"]
+    uploader  -> bilibili [label="视频 + 封面 + 元数据" color="#e91e63"]
+    cover     -> glm      [label="翻译 / 摘要" color="#e91e63" style=dashed]
+    uploader  -> cover    [style=dashed color="#9c27b0"]
+
+    // 功能模块 -> 系统工具
+    vproc   -> ffmpeg_bin [color="#757575" style=dashed]
+    download -> bun_bin   [label="JS 运行时 (可选)" color="#757575" style=dashed]
+
+    // 持久化读写
+    flask    -> config_yaml  [label="读" color="#009688" style=dashed]
+    api      -> config_yaml  [label="读/写" color="#009688" style=dashed]
+    uploader -> cookies_json [label="登录态" color="#009688" style=dashed]
+    scan     -> scan_cache   [label="缓存读写" color="#009688" style=dashed]
+    transcode -> upload_meta [label="写入队列" color="#009688" style=dashed]
+    upload   -> upload_meta  [label="标记已传" color="#009688" style=dashed]
+    upload   -> history_json [label="记录 vid" color="#009688" style=dashed]
+    download -> data_dir     [label="写 mp4/webp/vtt" color="#009688" style=dashed]
+    transcode -> data_dir    [label="写 _final.mp4" color="#009688" style=dashed]
+    data_dir -> upload       [label="读 _final.mp4" color="#009688" style=dashed]
+
+    // ── 图例 ─────────────────────────────────────────────────────────
+    subgraph cluster_legend {
+        label="图例"
+        style="rounded"
+        color="#aaaaaa"
+        fontname="Microsoft YaHei"
+        fontsize=11
+
+        leg1 [label="─── 主流程调用" shape=plaintext fontname="Microsoft YaHei"]
+        leg2 [label="- - - 异步/依赖调用" shape=plaintext fontname="Microsoft YaHei"]
+        leg3 [label="粗线  Pipeline 状态流转" shape=plaintext fontname="Microsoft YaHei"]
+    }
+}

@@ -84,6 +84,10 @@ class YouTubeDownloader:
             'format': 'bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/best[height<=1080][ext=mp4]/best',
             'merge_output_format': 'mp4',
             'writethumbnail': True,
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['zh-Hans'],
+            'subtitlesformat': 'vtt',
             'ignoreerrors': True,
             'noplaylist': True,
             'nocheckcertificate': True,
@@ -280,7 +284,30 @@ class YouTubeDownloader:
             v_dir = self._find_video_dir(video_id)
             if v_dir:
                 filepath = os.path.join(v_dir, f"{video_id}.mp4")
+                # Also accept title-named mp4 (yt-dlp may use title for merged formats)
+                if not os.path.exists(filepath):
+                    mp4s = [f for f in os.listdir(v_dir)
+                            if f.endswith('.mp4') and not f.endswith('_final.mp4')]
+                    if mp4s:
+                        mp4s.sort(key=lambda f: os.path.getsize(os.path.join(v_dir, f)), reverse=True)
+                        filepath = os.path.join(v_dir, mp4s[0])
                 if os.path.exists(filepath):
+                    # Download subtitles if missing
+                    has_sub = any(f.endswith('.zh-Hans.vtt') or f.endswith('.zh-Hans.ass')
+                                  for f in os.listdir(v_dir))
+                    if not has_sub:
+                        logging.info(f"[{video_id}] Fetching missing subtitles...")
+                        sub_opts = self._make_ydl_opts({
+                            'skip_download': True,
+                            'outtmpl': os.path.join(v_dir, f'{video_id}.%(ext)s'),
+                            'quiet': True,
+                        })
+                        try:
+                            import yt_dlp as _yt
+                            with _yt.YoutubeDL(sub_opts) as ydl:
+                                ydl.download([f'https://www.youtube.com/watch?v={video_id}'])
+                        except Exception as e:
+                            logging.warning(f"[{video_id}] Subtitle fetch failed: {e}")
                     logging.info(f"[{video_id}] Already downloaded, skipping.")
                     return self._build_video_dict(video_id, filepath, v_dir, title=title)
 
@@ -299,6 +326,8 @@ class YouTubeDownloader:
         dl_opts = self._make_ydl_opts({
             'outtmpl': os.path.join(v_dir, '%(id)s.%(ext)s'),
             'extract_flat': False,
+            'overwrites': False,       # don't re-download video if exists
+            'write_all_thumbnails': False,
             'progress_hooks': [self._make_progress_hook(progress_cb, cancel_check)],
         })
         
@@ -319,8 +348,17 @@ class YouTubeDownloader:
 
         filepath = os.path.join(v_dir, f"{video_id}.mp4")
         if not os.path.exists(filepath):
-            logging.error(f"File not found after download: {filepath}")
-            return None
+            # yt-dlp may use title-based filename when merging certain format combinations
+            mp4s = [f for f in os.listdir(v_dir)
+                    if f.endswith('.mp4') and not f.endswith('_final.mp4')]
+            if mp4s:
+                # Pick the largest mp4 (the actual video, not a stray small file)
+                mp4s.sort(key=lambda f: os.path.getsize(os.path.join(v_dir, f)), reverse=True)
+                filepath = os.path.join(v_dir, mp4s[0])
+                logging.info(f"[{video_id}] Expected {video_id}.mp4 not found, using: {mp4s[0]}")
+            else:
+                logging.error(f"File not found after download: {filepath}")
+                return None
 
         result = self._build_video_dict(
             video_id, filepath, v_dir,
@@ -337,10 +375,14 @@ class YouTubeDownloader:
         youtube_url: str = None
     ) -> Dict:
         cover_path = ''
+        subtitle_zh = ''
         for fname in os.listdir(v_dir):
-            if fname.startswith(video_id) and fname.endswith(('.webp', '.jpg', '.jpeg', '.png')):
+            if not fname.startswith(video_id):
+                continue
+            if fname.endswith(('.webp', '.jpg', '.jpeg', '.png')) and not cover_path:
                 cover_path = os.path.join(v_dir, fname)
-                break
+            elif fname.endswith('.zh-Hans.vtt') or fname.endswith('.zh-Hans.ass'):
+                subtitle_zh = os.path.join(v_dir, fname)
         return {
             'id': video_id,
             'title': title or video_id,
@@ -348,6 +390,7 @@ class YouTubeDownloader:
             'youtube_url': youtube_url or f'https://www.youtube.com/watch?v={video_id}',
             'filepath': filepath,
             'cover_path': cover_path,
+            'subtitle_zh': subtitle_zh,
         }
 
     def _make_progress_hook(self, progress_cb: Callable, cancel_check: Callable = None):
