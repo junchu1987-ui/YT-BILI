@@ -90,9 +90,22 @@ function connectSSE() {
   });
   es.addEventListener('state', e => {
     const d = JSON.parse(e.data);
+    const prevStatus = S.status;
     Object.assign(S, d);
     if (d.upload_meta) S.uploadMeta = d.upload_meta;
     renderPipeline();
+    if (d.status === 'scan_done' && prevStatus !== 'scan_done') {
+      _triggerBiliCheck();
+    }
+  });
+  es.addEventListener('bili_check', e => {
+    const d = JSON.parse(e.data);
+    S.candidates.forEach(c => {
+      if (c.channel_id === d.channel_id || c.channel_name === d.channel_name) {
+        c._bili_check = d.result;
+        _updateBiliCheckBadge(c.id, d.result);
+      }
+    });
   });
   es.addEventListener('progress', e => {
     const d = JSON.parse(e.data);
@@ -460,6 +473,7 @@ function renderVideoSection() {
         <div class="video-title" title="${escHtml(displayTitle)}">${escHtml(displayTitle)}</div>
         ${showOrigTitle ? `<div class="video-orig-title" title="${escHtml(c.title)}">${escHtml(c.title)}</div>` : ''}
         <div class="video-meta">${c.id} · ${labelType(c.url_type)}</div>
+        <div id="bili-check-${c.id}" class="bili-check-wrap">${status === 'scan_done' && !isSkip ? (c._bili_check ? _biliCheckBadgeHtml(c._bili_check) : '<span class="badge badge-checking">B站核查中</span>') : ''}</div>
       </div>
       ${progHtml}
       ${statusBadge}
@@ -954,6 +968,7 @@ async function loadSettings() {
   document.getElementById('cfg-desc').value  = cfg.desc_prefix || '';
   document.getElementById('cfg-zhipu-key').value = cfg.zhipu_key || '';
   document.getElementById('cfg-upload-interval').value = cfg.upload_interval ?? 30;
+  document.getElementById('cfg-bili-check-sim').value = cfg.bili_check_similarity ?? 0.75;
   S.defaultTags = cfg.default_tags || ['YouTube', '搬运', 'AI翻译', '中字'];
   renderCfgTags(S.defaultTags);
 
@@ -981,6 +996,7 @@ document.getElementById('btn-save-config').addEventListener('click', async () =>
     zhipu_key:    document.getElementById('cfg-zhipu-key').value.trim(),
     default_tags: S.defaultTags,
     upload_interval: parseInt(document.getElementById('cfg-upload-interval').value) || 0,
+    bili_check_similarity: parseFloat(document.getElementById('cfg-bili-check-sim').value) || 0.75,
   };
   const res = await api('POST', '/api/config', cfg);
   if (res && res.ok) {
@@ -1231,4 +1247,44 @@ function renderCalendar() {
       </div>`;
     trayItems.appendChild(card);
   });
+}
+
+// ── B站作者核查 ───────────────────────────────────────────────────────────────
+function _biliCheckBadgeHtml(result) {
+  if (!result) return '';
+  if (result.status === 'found') {
+    const pct = Math.round((result.similarity || 0) * 100);
+    const name = escHtml(result.match_name || '');
+    const url = escHtml(result.bili_url || '');
+    return `<a class="badge badge-warn bili-check-link" href="${url}" target="_blank" rel="noopener"
+        title="B站疑似同名UP主：${name}（相似度${pct}%）&#10;点击查看主页">⚠ 疑似有B站号</a>`;
+  }
+  if (result.status === 'error') {
+    return `<span class="badge badge-fail" title="B站核查请求失败">查询失败</span>`;
+  }
+  return '';
+}
+
+function _updateBiliCheckBadge(vid, result) {
+  const el = document.getElementById('bili-check-' + vid);
+  if (!el) return;
+  el.innerHTML = _biliCheckBadgeHtml(result);
+}
+
+function _triggerBiliCheck() {
+  const seen = new Set();
+  const channels = [];
+  S.candidates.forEach(c => {
+    const key = c.channel_id || c.channel_name;
+    if (key && !seen.has(key)) {
+      seen.add(key);
+      channels.push({ channel_id: c.channel_id || '', channel_name: c.channel_name || '' });
+    }
+  });
+  if (!channels.length) return;
+  fetch('/api/bili_check', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channels }),
+  }).catch(() => {});
 }

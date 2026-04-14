@@ -70,7 +70,7 @@ def load_config():
             'app': {'work_dir': './data', 'proxy': '', 'host': '127.0.0.1', 'port': 5000},
             'youtube': {'sources': []},
             'ffmpeg': {'bin_path': 'ffmpeg', 'intro_video_path': './assets/intro.mp4'},
-            'bilibili': {'tid': 122, 'desc_prefix': '本视频搬运自YouTube。\n\n原视频链接：{youtube_url}\n\n\n'}
+            'bilibili': {'tid': 122, 'desc_prefix': '本视频搬运自YouTube。\n\n原视频链接：{youtube_url}\n\n\n', 'bili_check_similarity': 0.75}
         }
     with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
         return yaml.safe_load(f)
@@ -388,6 +388,8 @@ def run_scan():
                                 'formats': all_formats,
                                 'rec_format_id': rec_format_id,
                                 'cached_at': now,
+                                'channel_name': e.get('uploader') or e.get('channel', ''),
+                                'channel_id': e.get('channel_id') or e.get('uploader_id', ''),
                             }
                             cache_dirty = True
 
@@ -399,7 +401,9 @@ def run_scan():
                             'url_type': 'video',
                             'already_downloaded': False,
                             'formats': all_formats,
-                            'rec_format_id': rec_format_id
+                            'rec_format_id': rec_format_id,
+                            'channel_name': e.get('uploader') or e.get('channel', '') or scan_cache.get(vid, {}).get('channel_name', ''),
+                            'channel_id': e.get('channel_id') or e.get('uploader_id', '') or scan_cache.get(vid, {}).get('channel_id', ''),
                         })
                 except Exception as e:
                     log_to_web('error', f"源解析失败 {url}: {str(e)}")
@@ -1272,6 +1276,7 @@ def get_config():
         'zhipu_key': cfg.get('zhipu', {}).get('api_key', ''),
         'default_tags': cfg['bilibili'].get('default_tags', []),
         'upload_interval': cfg['bilibili'].get('upload_interval', 30),
+        'bili_check_similarity': cfg['bilibili'].get('bili_check_similarity', 0.75),
     })
 
 @app.route('/api/config', methods=['POST'])
@@ -1289,6 +1294,9 @@ def set_config():
         cfg['bilibili']['default_tags'] = [t.strip() for t in data['default_tags'] if t.strip()]
     if 'upload_interval' in data:
         cfg['bilibili']['upload_interval'] = max(0, int(data['upload_interval']))
+    if 'bili_check_similarity' in data:
+        val = float(data['bili_check_similarity'])
+        cfg['bilibili']['bili_check_similarity'] = max(0.5, min(1.0, val))
     save_config(cfg)
     return jsonify({'ok': True})
 
@@ -1392,6 +1400,48 @@ def get_thumb(vid):
                     return send_file(os.path.join(entry.path, fname))
 
     return '', 404
+
+# ── Bilibili author check ──────────────────────────────────────────────────────
+@app.route('/api/bili_check', methods=['POST'])
+def trigger_bili_check():
+    """扫描完成后前端调用，后台逐个查询频道在B站的同名账号。"""
+    data = request.json or {}
+    channels = data.get('channels', [])
+    if not channels:
+        return jsonify({'ok': True, 'skipped': True})
+
+    cfg = load_config()
+    threshold = float(cfg.get('bilibili', {}).get('bili_check_similarity', 0.75))
+
+    def worker():
+        from bili_checker import check_channel
+        for ch in channels:
+            if S['cancel_flag']:
+                break
+            cid = ch.get('channel_id', '')
+            cname = ch.get('channel_name', '')
+            if not cname:
+                continue
+            try:
+                result = check_channel(cname, cid, threshold=threshold)
+                broadcast('bili_check', {
+                    'channel_id': cid,
+                    'channel_name': cname,
+                    'result': result,
+                })
+            except Exception as exc:
+                logger.warning(f"bili_check failed for '{cname}': {exc}")
+                broadcast('bili_check', {
+                    'channel_id': cid,
+                    'channel_name': cname,
+                    'result': {'status': 'error', 'match_name': '', 'match_mid': 0,
+                               'match_fans': 0, 'similarity': 0.0, 'bili_url': ''},
+                })
+            time.sleep(0.5)
+
+    threading.Thread(target=worker, daemon=True).start()
+    return jsonify({'ok': True})
+
 
 # ── Bilibili status (sidebar) ─────────────────────────────────────────────────
 @app.route('/api/bilibili/status', methods=['GET'])

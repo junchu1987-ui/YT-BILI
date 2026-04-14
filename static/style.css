@@ -360,6 +360,11 @@ body {
 .badge-skip { background: var(--bg3); color: var(--text2); }
 .badge-done { background: rgba(62,207,142,.12); color: var(--green); }
 .badge-fail { background: rgba(240,96,96,.12); color: var(--red); }
+.badge-warn { background: rgba(240,192,64,.15); color: var(--yellow); }
+.badge-checking { background: var(--bg3); color: var(--text2); animation: bili-pulse 1.5s ease-in-out infinite; }
+@keyframes bili-pulse { 0%,100% { opacity:1 } 50% { opacity:.35 } }
+.bili-check-wrap { display: inline-flex; margin-top: 3px; }
+a.bili-check-link { text-decoration: none; cursor: pointer; }
 
 /* ── Log panel ──────────────────────────────────────────────── */
 .log-section {

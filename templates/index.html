@@ -320,6 +320,11 @@
         <input type="number" id="cfg-upload-interval" min="0" max="3600" style="width:120px">
         <span class="form-hint">每两个视频上传之间的等待时间，0 表示不等待</span>
       </div>
+      <div class="form-group">
+        <label>B站同名核查相似度阈值</label>
+        <input type="number" id="cfg-bili-check-sim" min="0.5" max="1.0" step="0.05" style="width:120px">
+        <span class="form-hint">扫描完成后自动检查原作者是否在B站有同名账号，阈值越高误报越少（默认 0.75）</span>
+      </div>
       <button class="btn btn-primary" id="btn-save-config">保存设置</button>
       <span class="save-ok" id="save-ok" style="display:none">✓ 已保存</span>
     </div>
