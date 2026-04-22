@@ -97,7 +97,7 @@ class YouTubeDownloader:
             'fragment_retries': 10,
             'compat_opts': ['no-keep-alive'],
             'socket_timeout': 15,
-            'cookiefile': 'youtube_cookies.txt',
+            'cookiefile': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'youtube_cookies.txt'),
             'js_runtimes': (
                 {'bun': {'path': self.bun_path}}
                 if self.bun_path and os.path.exists(self.bun_path)
