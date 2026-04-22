@@ -14,7 +14,7 @@ const S = {
   selectedFormats: {},   // videoID -> Set of formatIDs
   formatsExpanded: {},  // videoID -> bool, default false (collapsed)
   metaExpanded: {},     // videoID -> bool, default false (collapsed)
-  uploadMeta: {},       // videoID -> { title, tid, tags: [] }
+  videoMeta: {},       // videoID -> { title, tid, tags: [] }
   globalTid: 122,
   defaultTags: [],
 };
@@ -25,8 +25,8 @@ let _saveMetaTimer = null;
 function scheduleMetaSave(vid) {
   clearTimeout(_saveMetaTimer);
   _saveMetaTimer = setTimeout(() => {
-    const payload = vid ? { [vid]: S.uploadMeta[vid] } : S.uploadMeta;
-    fetch('/api/upload_meta/save', {
+    const payload = vid ? { [vid]: S.videoMeta[vid] } : S.videoMeta;
+    fetch('/api/video_meta/save', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ meta: payload })
@@ -82,9 +82,9 @@ function connectSSE() {
   es.addEventListener('snapshot', e => {
     const d = JSON.parse(e.data);
     Object.assign(S, d);
-    // Restore persisted uploadMeta from backend (snake_case -> camelCase)
-    if (d.upload_meta && Object.keys(d.upload_meta).length) {
-      S.uploadMeta = d.upload_meta;
+    // Restore persisted videoMeta from backend (snake_case -> camelCase)
+    if (d.video_meta && Object.keys(d.video_meta).length) {
+      S.videoMeta = d.video_meta;
     }
     renderPipeline();
   });
@@ -92,7 +92,7 @@ function connectSSE() {
     const d = JSON.parse(e.data);
     const prevStatus = S.status;
     Object.assign(S, d);
-    if (d.upload_meta) S.uploadMeta = d.upload_meta;
+    if (d.video_meta) S.videoMeta = d.video_meta;
     renderPipeline();
     if (d.status === 'scan_done' && prevStatus !== 'scan_done') {
       _triggerBiliCheck();
@@ -176,12 +176,22 @@ function renderPipeline() {
     btnCancel.style.display = 'none';
   }
 
-  // Step indicators
+  // Step indicators — done steps are clickable (jump back); active/future steps are not
   stepIds.forEach(id => {
     const el = document.getElementById('step-' + id);
     el.className = 'step';
-    if ((sm.done || []).includes(id)) el.classList.add('done');
-    else if (sm.active === id) el.classList.add('active');
+    const isDone = (sm.done || []).includes(id);
+    const isActive = sm.active === id;
+    if (isDone) el.classList.add('done');
+    else if (isActive) el.classList.add('active');
+
+    if (isDone && !sm.busy) {
+      el.classList.add('clickable');
+      el.onclick = () => jumpToStep(id);
+    } else {
+      el.classList.remove('clickable');
+      el.onclick = null;
+    }
   });
 
   renderActionPanel(sm);
@@ -463,7 +473,8 @@ function renderVideoSection() {
     const showDoneBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
     const showUploadBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
     const showRetranslateBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
-    const displayTitle = (S.uploadMeta[c.id] && S.uploadMeta[c.id].title) ? S.uploadMeta[c.id].title : (c.translated_title || c.title);
+    const showStagesBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded;
+    const displayTitle = (S.videoMeta[c.id] && S.videoMeta[c.id].title) ? S.videoMeta[c.id].title : (c.translated_title || c.title);
     const showOrigTitle = displayTitle !== c.title;
     itemRow.innerHTML = `
       ${isDraggable ? '<div class="drag-handle">⠿</div>' : ''}
@@ -482,16 +493,17 @@ function renderVideoSection() {
       ${showDelBtn ? `<button class="btn-del-meta" data-vid="${c.id}" title="从上传队列移除">✕</button>` : ''}
       ${showDoneBtn ? `<button class="btn-mark-done" data-vid="${c.id}" title="标记为已手动上传">✓ 已上传</button>` : ''}
       ${showRetranslateBtn ? `<button class="btn-retranslate btn-retry" data-vid="${c.id}" title="重新翻译此视频标题">↺ 重翻</button>` : ''}
-      ${showUploadBtn ? `<button class="btn-upload-single btn-retry" data-vid="${c.id}" title="立即上传此视频">⬆ 上传</button>` : ''}`;
+      ${showUploadBtn ? `<button class="btn-upload-single btn-retry" data-vid="${c.id}" title="立即上传此视频">⬆ 上传</button>` : ''}
+      ${showStagesBtn ? `<button class="btn-stages-toggle btn-retry" data-vid="${c.id}" title="手动修改阶段状态">⚙ 状态</button>` : ''}`;
 
     if (showDelBtn) {
         itemRow.querySelector('.btn-del-meta').addEventListener('click', () => {
-            fetch(`/api/upload_meta/${c.id}`, { method: 'DELETE' }).catch(() => {});
+            fetch(`/api/video_meta/${c.id}`, { method: 'DELETE' }).catch(() => {});
         });
     }
     if (showDoneBtn) {
         itemRow.querySelector('.btn-mark-done').addEventListener('click', () => {
-            fetch(`/api/upload_meta/${c.id}/done`, { method: 'POST' }).catch(() => {});
+            fetch(`/api/video_meta/${c.id}/done`, { method: 'POST' }).catch(() => {});
         });
     }
     if (showRetranslateBtn) {
@@ -579,8 +591,8 @@ function renderVideoSection() {
 
     // Upload meta editor (only when waiting for upload)
     if (['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded) {
-        if (!S.uploadMeta[c.id]) {
-            S.uploadMeta[c.id] = {
+        if (!S.videoMeta[c.id]) {
+            S.videoMeta[c.id] = {
                 title: c.translated_title || c.title || '',
                 tid: String(S.globalTid),
                 tags: [...S.defaultTags],
@@ -591,20 +603,20 @@ function renderVideoSection() {
                 cover_text: ''
             };
         }
-        // Backfill desc from server-pushed upload_meta if not yet set locally
-        if (S.uploadMeta[c.id].desc === undefined) {
-            S.uploadMeta[c.id].desc = '';
+        // Backfill desc from server-pushed video_meta if not yet set locally
+        if (S.videoMeta[c.id].desc === undefined) {
+            S.videoMeta[c.id].desc = '';
         }
-        if (S.uploadMeta[c.id].cover_text === undefined) {
-            S.uploadMeta[c.id].cover_text = '';
+        if (S.videoMeta[c.id].cover_text === undefined) {
+            S.videoMeta[c.id].cover_text = '';
         }
         // Ensure tags is always an array
-        if (!Array.isArray(S.uploadMeta[c.id].tags)) {
-            S.uploadMeta[c.id].tags = S.uploadMeta[c.id].tags
-                ? String(S.uploadMeta[c.id].tags).split(',').map(t => t.trim()).filter(Boolean)
+        if (!Array.isArray(S.videoMeta[c.id].tags)) {
+            S.videoMeta[c.id].tags = S.videoMeta[c.id].tags
+                ? String(S.videoMeta[c.id].tags).split(',').map(t => t.trim()).filter(Boolean)
                 : [...S.defaultTags];
         }
-        const m = S.uploadMeta[c.id];
+        const m = S.videoMeta[c.id];
         // Default datetime for scheduled publish: now + 5 hours (biliup requires >4h)
         const defaultDt = new Date(Date.now() + 5 * 3600 * 1000);
         const defaultDtLocal = new Date(defaultDt - defaultDt.getTimezoneOffset() * 60000)
@@ -701,19 +713,19 @@ function renderVideoSection() {
         editor.querySelector('.btn-tag-add').addEventListener('click', addTag);
         tagInput.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); addTag(); } });
         // Sync other fields
-        editor.querySelector('.meta-title').addEventListener('input', e => { S.uploadMeta[c.id].title = e.target.value; scheduleMetaSave(c.id); });
-        editor.querySelector('.meta-cover-text').addEventListener('input', e => { S.uploadMeta[c.id].cover_text = e.target.value; scheduleMetaSave(c.id); });
-        editor.querySelector('.meta-tid').addEventListener('change', e => { S.uploadMeta[c.id].tid = e.target.value; scheduleMetaSave(c.id); });
+        editor.querySelector('.meta-title').addEventListener('input', e => { S.videoMeta[c.id].title = e.target.value; scheduleMetaSave(c.id); });
+        editor.querySelector('.meta-cover-text').addEventListener('input', e => { S.videoMeta[c.id].cover_text = e.target.value; scheduleMetaSave(c.id); });
+        editor.querySelector('.meta-tid').addEventListener('change', e => { S.videoMeta[c.id].tid = e.target.value; scheduleMetaSave(c.id); });
         // Copyright radio toggle
         editor.querySelectorAll(`input[name="cr-${c.id}"]`).forEach(radio => {
             radio.addEventListener('change', () => {
                 const sourceInput = editor.querySelector('.meta-source');
-                S.uploadMeta[c.id].copyright = Number(radio.value);
+                S.videoMeta[c.id].copyright = Number(radio.value);
                 sourceInput.style.display = radio.value === '2' ? '' : 'none';
                 scheduleMetaSave(c.id);
             });
         });
-        editor.querySelector('.meta-source').addEventListener('input', e => { S.uploadMeta[c.id].source = e.target.value; scheduleMetaSave(c.id); });
+        editor.querySelector('.meta-source').addEventListener('input', e => { S.videoMeta[c.id].source = e.target.value; scheduleMetaSave(c.id); });
         // Schedule radio toggle
         editor.querySelectorAll(`input[name="sched-${c.id}"]`).forEach(radio => {
             radio.addEventListener('change', () => {
@@ -721,20 +733,20 @@ function renderVideoSection() {
                 if (radio.value === 'scheduled') {
                     dtWrap.style.display = '';
                     const dtInput = editor.querySelector('.meta-schedule-dt');
-                    S.uploadMeta[c.id].schedule_time = dtInput.value || defaultDtLocal;
+                    S.videoMeta[c.id].schedule_time = dtInput.value || defaultDtLocal;
                 } else {
                     dtWrap.style.display = 'none';
-                    S.uploadMeta[c.id].schedule_time = null;
+                    S.videoMeta[c.id].schedule_time = null;
                 }
                 scheduleMetaSave(c.id);
             });
         });
         editor.querySelector('.meta-schedule-dt').addEventListener('change', e => {
-            S.uploadMeta[c.id].schedule_time = e.target.value || null;
+            S.videoMeta[c.id].schedule_time = e.target.value || null;
             scheduleMetaSave(c.id);
         });
         editor.querySelector('.meta-desc').addEventListener('input', e => {
-            S.uploadMeta[c.id].desc = e.target.value;
+            S.videoMeta[c.id].desc = e.target.value;
             editor.querySelector('.desc-len').textContent = e.target.value.length;
             scheduleMetaSave(c.id);
         });
@@ -749,6 +761,48 @@ function renderVideoSection() {
             });
         }
         row.appendChild(editor);
+    }
+
+    // Stages editor
+    if (showStagesBtn) {
+        const stagesEditor = document.createElement('div');
+        stagesEditor.className = 'stages-editor collapsed';
+        stagesEditor.id = 'stages-' + c.id;
+        const stageLabels = { scan: '扫描', download: '下载', transcode: '转码', translate: '翻译', upload: '上传' };
+        const stageKeys = ['scan', 'download', 'transcode', 'translate', 'upload'];
+        const currentStages = (S.videoMeta[c.id] && S.videoMeta[c.id].stages) || {};
+        stagesEditor.innerHTML = `
+          <div class="stages-editor-title">手动修改阶段状态</div>
+          <div class="stages-rows">
+            ${stageKeys.map(k => {
+              const st = currentStages[k] ? currentStages[k].status : 'pending';
+              return `<div class="stages-row">
+                <span class="stages-label">${stageLabels[k]}</span>
+                <select class="stages-select" data-stage="${k}">
+                  <option value="pending" ${st==='pending'?'selected':''}>pending</option>
+                  <option value="done"    ${st==='done'?'selected':''}>done</option>
+                  <option value="failed"  ${st==='failed'?'selected':''}>failed</option>
+                  <option value="skipped" ${st==='skipped'?'selected':''}>skipped</option>
+                </select>
+              </div>`;
+            }).join('')}
+          </div>`;
+        stagesEditor.querySelectorAll('.stages-select').forEach(sel => {
+            sel.addEventListener('change', () => {
+                fetch(`/api/video_meta/${c.id}/stages`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ stage: sel.dataset.stage, status: sel.value })
+                }).catch(() => {});
+            });
+        });
+        const stagesBtn = itemRow.querySelector('.btn-stages-toggle');
+        if (stagesBtn) {
+            stagesBtn.addEventListener('click', () => {
+                stagesEditor.classList.toggle('collapsed');
+            });
+        }
+        row.appendChild(stagesEditor);
     }
 
     listEl.appendChild(row);
@@ -789,6 +843,10 @@ function updateProgress(videoId, pct, msg) {
 }
 
 // ── Pipeline actions ──────────────────────────────────────────────────────────
+async function jumpToStep(step) {
+  const r = await api('POST', `/api/jump/${step}`);
+  if (r && r.error) alert(r.error);
+}
 async function doScan() { selectedIds.clear(); await api('POST', '/api/scan'); }
 async function doDownload() {
   const ids = [...selectedIds];
@@ -816,7 +874,7 @@ async function doTranscode() { await api('POST', '/api/transcode'); }
 async function doUpload() {
   const meta = {};
   S.transcoded.forEach(c => {
-    const m = S.uploadMeta[c.id];
+    const m = S.videoMeta[c.id];
     if (m) meta[c.id] = m;
   });
   await api('POST', '/api/upload', { meta });
@@ -827,7 +885,7 @@ async function doTranslate() {
 }
 
 async function doRescan() {
-  const r = await api('POST', '/api/upload_meta/rescan');
+  const r = await api('POST', '/api/video_meta/rescan');
   if (r && r.added > 0) logLine('info', `重新扫描完成，新增 ${r.added} 个视频到上传队列`);
   else logLine('info', '重新扫描完成，没有发现新视频');
 }
@@ -1149,7 +1207,7 @@ function calWeekLabel(sun) {
 }
 
 async function loadCalendar() {
-  Cal.meta = await api('GET', '/api/upload_meta');
+  Cal.meta = await api('GET', '/api/video_meta');
   renderCalendar();
   document.getElementById('cal-prev').onclick  = () => { Cal.weekOffset--; renderCalendar(); };
   document.getElementById('cal-next').onclick  = () => { Cal.weekOffset++; renderCalendar(); };

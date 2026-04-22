@@ -88,14 +88,16 @@ body {
 /* ── Main ───────────────────────────────────────────────────── */
 .main {
   flex: 1;
-  overflow-y: auto;
+  overflow: hidden;
   padding: 28px 32px;
   display: flex;
   flex-direction: column;
 }
 
-.tab-panel { display: none; flex-direction: column; gap: 20px; height: 100%; }
+.tab-panel { display: none; flex-direction: column; gap: 20px; height: 100%; min-height: 0; }
 .tab-panel.active { display: flex; }
+/* Non-pipeline tabs scroll themselves */
+.tab-panel.active:not(#tab-pipeline) { overflow-y: auto; }
 
 .page-header {
   display: flex;
@@ -127,6 +129,8 @@ body {
 }
 .step.active { border-color: var(--accent); background: rgba(91,141,238,.08); }
 .step.done { border-color: var(--green); background: rgba(62,207,142,.06); }
+.step.done.clickable { cursor: pointer; }
+.step.done.clickable:hover { border-color: var(--accent); background: rgba(91,141,238,.08); }
 .step.error { border-color: var(--red); }
 
 .step-num {
@@ -195,6 +199,11 @@ body {
 .select-all-label { display: flex; align-items: center; gap: 6px; cursor: pointer; color: var(--text2); }
 
 /* ── Video list ─────────────────────────────────────────────── */
+#video-list-section {
+  overflow-y: auto;
+  min-height: 0;
+  flex-shrink: 1;
+}
 .video-list { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
 
 .video-item {
@@ -369,7 +378,7 @@ a.bili-check-link { text-decoration: none; cursor: pointer; }
 /* ── Log panel ──────────────────────────────────────────────── */
 .log-section {
   flex: 1;
-  min-height: 0;
+  min-height: 160px;
   display: flex;
   flex-direction: column;
   background: var(--bg2);
@@ -708,4 +717,21 @@ code {
   color: var(--text); font-size: 10px; line-height: 1.3;
   display: -webkit-box; -webkit-line-clamp: 2;
   -webkit-box-orient: vertical; overflow: hidden;
+}
+
+/* Stages editor */
+.stages-editor {
+  border-top: 1px solid var(--border);
+  padding: 10px 14px;
+  background: var(--bg2);
+}
+.stages-editor.collapsed { display: none; }
+.stages-editor-title { font-size: 11px; color: var(--text2); margin-bottom: 8px; font-weight: 600; }
+.stages-rows { display: flex; flex-wrap: wrap; gap: 8px 16px; }
+.stages-row { display: flex; align-items: center; gap: 6px; }
+.stages-label { font-size: 12px; color: var(--text2); width: 36px; }
+.stages-select {
+  font-size: 11px; padding: 2px 4px;
+  background: var(--bg3); color: var(--text);
+  border: 1px solid var(--border); border-radius: 4px;
 }
