@@ -392,6 +392,10 @@ def run_scan():
                                 if m4a_audio else None
                             )
 
+                            def res_height(f):
+                                try: return int(f['resolution'].split('x')[1])
+                                except: return 0
+
                             # Fallback: any mp4 video-only <= 1080p by filesize
                             if not best_video:
                                 mp4_video = [
@@ -399,9 +403,6 @@ def run_scan():
                                     if f['ext'] == 'mp4' and f['acodec'] == 'none'
                                     and f['resolution'] not in ('', 'audio only')
                                 ]
-                                def res_height(f):
-                                    try: return int(f['resolution'].split('x')[1])
-                                    except: return 0
                                 mp4_video_1080 = [f for f in mp4_video if res_height(f) <= 1080]
                                 best_video = (
                                     sorted(mp4_video_1080, key=lambda f: f['filesize'], reverse=True)[0]
