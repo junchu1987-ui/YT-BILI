@@ -149,12 +149,10 @@ class VideoProcessor:
         with open(vtt_path, encoding='utf-8', errors='replace') as f:
             content = f.read()
 
-        entries = []
+        # Parse all blocks into (start_ms, end_ms, [clean_text_lines])
+        raw = []
         for block in re.split(r'\n\n+', content.strip()):
             lines = block.strip().splitlines()
-            if len(lines) < 2:
-                continue
-            # Find timestamp line
             ts_line = None
             text_lines = []
             for line in lines:
@@ -169,63 +167,123 @@ class VideoProcessor:
                 continue
             start_ms = ts_to_ms(m.group(1))
             end_ms = ts_to_ms(m.group(2))
-            if end_ms - start_ms < 200:
+            clean = [strip_cue_tags(l) for l in text_lines]
+            clean = [l for l in clean if l]
+            raw.append((start_ms, end_ms, clean))
+
+        # YouTube rolling VTT: snapshot blocks (~10ms, 1 line) mark when a new line
+        # appears on screen. Collect them with timestamps to build a timed text stream.
+        MAX_SNAP_DUR = 5000  # cap each snapshot's duration at 5s to avoid spanning silent gaps
+        snapshots = []  # (start_ms, end_ms, text)
+        for i, (start_ms, end_ms, clean) in enumerate(raw):
+            if end_ms - start_ms <= 20 and len(clean) == 1:
+                # end time = next snapshot's start, capped at MAX_SNAP_DUR
+                next_start = next(
+                    (raw[j][0] for j in range(i + 1, len(raw))
+                     if raw[j][1] - raw[j][0] <= 20 and len(raw[j][2]) == 1),
+                    start_ms + 3000
+                )
+                snap_end = min(next_start, start_ms + MAX_SNAP_DUR)
+                snapshots.append((start_ms, snap_end, clean[0]))
+
+        # Merge snapshot lines into a continuous timed character stream, then
+        # re-segment by punctuation keeping each segment <= MAX_CHARS characters.
+        MAX_CHARS = 20
+        PUNCT_HARD = re.compile(r'[。！？…]')   # always break after these
+        PUNCT_SOFT = re.compile(r'[，；、,;]')   # break here when segment is long enough
+
+        # Build list of (char, ms_position) by linearly interpolating each snapshot's span
+        timed_chars = []
+        for seg_start, seg_end, text in snapshots:
+            n = len(text)
+            if n == 0:
                 continue
+            for ci, ch in enumerate(text):
+                t = seg_start + (seg_end - seg_start) * ci // n
+                timed_chars.append((ch, t))
 
-            # Strip cue tags from all text lines, keep non-empty
-            clean_lines = [strip_cue_tags(l) for l in text_lines]
-            clean_lines = [l for l in clean_lines if l]
-            if not clean_lines:
-                continue
+        # Segment the character stream
+        entries = []
+        i = 0
+        total = len(timed_chars)
+        while i < total:
+            seg_start_t = timed_chars[i][1]
+            j = i
+            # Advance until we hit a hard punct, or length >= MAX_CHARS at a soft punct,
+            # or length >= MAX_CHARS*2 (hard cap, break anywhere)
+            while j < total:
+                ch = timed_chars[j][0]
+                length = j - i + 1
+                if PUNCT_HARD.match(ch):
+                    j += 1  # include the punctuation
+                    break
+                if length >= MAX_CHARS and PUNCT_SOFT.match(ch):
+                    j += 1  # include the soft punct
+                    break
+                if length >= MAX_CHARS * 2:
+                    break
+                j += 1
+            seg_text = ''.join(c for c, _ in timed_chars[i:j]).strip()
+            seg_end_t = timed_chars[j][1] if j < total else timed_chars[-1][1] + 500
+            seg_end_t = min(seg_end_t, seg_start_t + MAX_SNAP_DUR)
+            if seg_text:
+                entries.append((seg_start_t, seg_end_t, seg_text))
+            i = j
 
-            # YouTube rolling subtitle structure:
-            # Line 1 = previous sentence (already complete)
-            # Line 2 = current sentence being spoken (with cue tags)
-            # We want line 2 (the new content). If only one line, use it.
-            if len(clean_lines) >= 2:
-                text = clean_lines[1]  # current sentence
-            else:
-                text = clean_lines[0]
+        # Fallback: if snapshot algorithm produced nothing, use raw long blocks directly
+        if not entries:
+            for start_ms, end_ms, clean in raw:
+                text = ' '.join(clean).strip()
+                if text:
+                    entries.append((start_ms, end_ms, text))
 
-            if not text:
-                continue
-            entries.append((start_ms, end_ms, text))
+        # Discard entries that are only noise (外语/music/applause markers)
+        NOISE = re.compile(r'^[\[【]?(外语|音乐|掌声|Music|Applause|Laughter|笑声)[\]】]?$', re.IGNORECASE)
+        entries = [(s, e, t) for s, e, t in entries if not NOISE.match(t.strip())]
 
-        # Merge consecutive entries with identical text
-        merged = []
-        for start, end, text in entries:
-            if merged and merged[-1][2] == text:
-                merged[-1][1] = end
-            else:
-                merged.append([start, end, text])
-
-        # Merge entries that are very close in time (gap < 300ms) and form natural sentences
-        # i.e. previous entry doesn't end with sentence-final punctuation
-        sentence_end = re.compile(r'[。！？…]$')
-        joined = []
-        for start, end, text in merged:
-            if (joined and not sentence_end.search(joined[-1][2])
-                    and start - joined[-1][1] < 300):
-                joined[-1][1] = end
-                joined[-1][2] += text
-            else:
-                joined.append([start, end, text])
+        # If fewer than 5 meaningful entries remain, skip subtitle burn-in entirely
+        if len(entries) < 5:
+            logging.info(f"Subtitle skipped: only {len(entries)} meaningful entries in {os.path.basename(vtt_path)}")
+            return None
 
         with open(srt_path, 'w', encoding='utf-8') as f:
-            for i, (start, end, text) in enumerate(joined, 1):
-                f.write(f"{i}\n{ms_to_ts(start)} --> {ms_to_ts(end)}\n{text}\n\n")
+            for idx, (start, end, text) in enumerate(entries, 1):
+                f.write(f"{idx}\n{ms_to_ts(start)} --> {ms_to_ts(end)}\n{text}\n\n")
 
         return srt_path
 
     def _sub_filter(self, srt_path, margin_v, font_size, colour):
         """Build a subtitles= filter string with force_style for a given SRT file."""
-        # ffmpeg subtitles filter on Windows needs forward slashes and escaped colons
-        safe_path = srt_path.replace('\\', '/').replace(':', '\\:')
+        # ffmpeg subtitles filter: backslash→forward slash, then escape filter-graph specials
+        safe_path = srt_path.replace('\\', '/')
+        # Escape characters special to ffmpeg's filter graph / subtitles filter
+        for ch in (':', '(', ')', '[', ']', ',', ';', "'"):
+            safe_path = safe_path.replace(ch, '\\' + ch)
         style = (f"PlayResX=1920,PlayResY=1080,Alignment=2,MarginV={margin_v},"
                  f"Fontname=SimSun,FontSize={font_size},PrimaryColour={colour},"
-                 f"OutlineColour=&H000000&,BorderStyle=3,Outline=2,Shadow=0,"
+                 f"OutlineColour=&H00000000&,BorderStyle=1,Outline=3,Shadow=1,"
                  f"WrapStyle=1")
         return f"subtitles='{safe_path}':force_style='{style}'"
+
+    def _validate_mp4(self, path, source_duration=None, min_ratio=0.9):
+        """用 ffprobe 验证 mp4 文件：moov atom 可读、时长 > 0，且不短于源视频的 min_ratio。"""
+        try:
+            r = subprocess.run(
+                [self.ffmpeg_path.replace('ffmpeg', 'ffprobe'),
+                 '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'csv=p=0', path],
+                capture_output=True, text=True, timeout=30
+            )
+            duration = float(r.stdout.strip())
+            if duration <= 0:
+                return False
+            if source_duration and duration < source_duration * min_ratio:
+                logging.warning(f"_validate_mp4: {os.path.basename(path)} duration {duration:.1f}s < {source_duration * min_ratio:.1f}s (source {source_duration:.1f}s)")
+                return False
+            return True
+        except Exception as e:
+            logging.warning(f"_validate_mp4 failed for {path}: {e}")
+            return False
 
     def process(self, video_data, cancel_check=None, progress_cb=None):
         """
@@ -240,10 +298,11 @@ class VideoProcessor:
         final_output = os.path.join(video_dir, f"{base_name}_final.mp4")
         
         if os.path.exists(final_output):
-            if os.path.getsize(final_output) > 0:
+            if self._validate_mp4(final_output):
                 if progress_cb: progress_cb(100)
                 return final_output
             else:
+                logging.warning(f"process: existing {os.path.basename(final_output)} failed validation, removing and re-transcoding")
                 os.remove(final_output)
 
         # Step 1: Deep Probe Main Video (The Standard)
@@ -309,14 +368,16 @@ class VideoProcessor:
         # Build subtitle burn-in chain (appended after concat)
         sub_filters = []
         for vtt_key, margin_v, font_size, colour in [
-            ('subtitle_zh', 20, 30, '&H00FFFFFF&'),   # 中文：白色，底部贴边
+            ('subtitle_zh', 60, 58, '&H00FFFFFF&'),   # 中文：白色，1080p标准字号
         ]:
             vtt_path = video_data.get(vtt_key, '')
             if vtt_path and os.path.isfile(vtt_path):
                 srt_path = self._vtt_to_srt(vtt_path)
-                if srt_path:
+                if srt_path and os.path.getsize(srt_path) > 0:
                     sub_filters.append(self._sub_filter(srt_path, margin_v, font_size, colour))
                     logging.info(f"Subtitle burn-in: {vtt_key} -> {srt_path}")
+                else:
+                    logging.info(f"Subtitle skipped (empty SRT): {vtt_key}")
 
         if sub_filters:
             # Chain subtitle filters after concat: [outv] → sub1 → sub2 → [outv_final]
