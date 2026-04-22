@@ -53,3 +53,24 @@ concat.txt
 intro_transcoded.mp4
 main_standardized.mp4
 intro_match_*.mp4
+
+# Node.js (one-time doc tooling)
+node_modules/
+package.json
+package-lock.json
+
+# Test artifacts
+test_out.mp4
+pytest_output.txt
+
+# Generated docs / misc artifacts
+ytbili_arch
+
+# Debug text files
+RUN.txt
+meta_check.txt
+snap_tail.txt
+srt_check.txt
+srt_long.txt
+srt_test_out.txt
+vtt_raw.txt
