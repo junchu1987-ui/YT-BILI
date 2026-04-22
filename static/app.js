@@ -886,8 +886,9 @@ async function doTranslate() {
 
 async function doRescan() {
   const r = await api('POST', '/api/video_meta/rescan');
-  if (r && r.added > 0) logLine('info', `重新扫描完成，新增 ${r.added} 个视频到上传队列`);
-  else logLine('info', '重新扫描完成，没有发现新视频');
+  const ts = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+  if (r && r.added > 0) appendLog(ts, 'info', `重新扫描完成，新增 ${r.added} 个视频到上传队列`);
+  else appendLog(ts, 'info', '重新扫描完成，没有发现新视频');
 }
 async function doRetry(id)     { await api('POST', '/api/retry', { video_id: id }); }
 
@@ -1112,80 +1113,9 @@ checkBiliStatus();
 
 // ── Calendar ──────────────────────────────────────────────────────────────────
 
-// ── Mock data (PREVIEW ONLY — replace with api() call when confirmed) ─────────
-const MOCK_META = {
-  'RKOlM6c4lE8': {
-    title: '百年艺术装饰风桌子修复',
-    schedule_time: null,
-    uploaded: true,
-    uploaded_at: Math.floor(new Date('2026-03-30T10:15:00').getTime() / 1000),
-  },
-  'svQL4SUauew': {
-    title: '猫王宝马507修复：最传奇的豪车',
-    schedule_time: null,
-    uploaded: true,
-    uploaded_at: Math.floor(new Date('2026-04-01T09:45:00').getTime() / 1000),
-  },
-  'MvUez7ZbeD0': {
-    title: '英国手工打造摩根传奇跑车',
-    schedule_time: '2026-04-01T14:00',
-    uploaded: false,
-    queued_at: 0,
-  },
-  '60xULkHR5tM': {
-    title: '修复一台老式工坊车床',
-    schedule_time: '2026-04-02T08:30',
-    uploaded: false,
-    queued_at: 0,
-  },
-  'IVlaAxFIi8s': {
-    title: '我洗了史上最脏的毛毯！',
-    schedule_time: '2026-04-02T08:30',
-    uploaded: false,
-    queued_at: 0,
-  },
-  'WfmnFs48BlI': {
-    title: '沼泽泳池大改造',
-    schedule_time: '2026-04-03T20:00',
-    uploaded: false,
-    queued_at: 0,
-  },
-  'tkLW11WSIvY': {
-    title: '恶心泳池华丽变身',
-    schedule_time: '2026-04-04T15:30',
-    uploaded: false,
-    queued_at: 0,
-  },
-  'rCBQZPR9-mQ': {
-    title: '上次那修水管的坑了她，这次请了我',
-    schedule_time: '2026-04-05T11:00',
-    uploaded: false,
-    queued_at: 0,
-  },
-  'nsmp_AYm93M': {
-    title: '把山里那泉弄干净，水池也救活了！',
-    schedule_time: null,
-    uploaded: false,
-    queued_at: 0,
-  },
-  'fnjOmFVavxc': {
-    title: '史上最差阳台！极致ASMR高压水枪清洗',
-    schedule_time: null,
-    uploaded: false,
-    queued_at: 0,
-  },
-  'qd2s1kBO_Gs': {
-    title: '这得多脏？！志愿者帮社区中心清污垢',
-    schedule_time: null,
-    uploaded: false,
-    queued_at: 0,
-  },
-};
-
 const Cal = { weekOffset: 0, meta: null };
 const CAL_START_HOUR = 6;
 const CAL_END_HOUR   = 23;
-const CAL_HOUR_PX    = 60;
 const CAL_DAY_NAMES  = ['周日','周一','周二','周三','周四','周五','周六'];
 const CAL_MONTHS     = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 

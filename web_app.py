@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, Response, send_from_directory
+from flask import Flask, render_template, request, jsonify, Response
 from bili_uploader import BilibiliUploader
 import re
 
@@ -418,9 +418,6 @@ def run_scan():
 
                             # Combo fallback: when no separate tracks available
                             combo_formats = [f for f in all_formats if f['acodec'] != 'none' and f['vcodec'] != 'none']
-                            def res_height(f):
-                                try: return int(f['resolution'].split('x')[1])
-                                except: return 0
                             combo_1080 = [f for f in combo_formats if res_height(f) <= 1080]
                             best_combo = (
                                 sorted(combo_1080, key=lambda f: f['filesize'], reverse=True)[0]

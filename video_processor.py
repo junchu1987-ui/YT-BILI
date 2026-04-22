@@ -3,7 +3,6 @@ import re
 import subprocess
 import logging
 import json
-import shutil
 from fractions import Fraction
 
 class VideoProcessor:

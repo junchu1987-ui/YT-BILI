@@ -10,9 +10,11 @@
   --accent-dim: #3a5fcc;
   --green: #3ecf8e;
   --yellow: #f0c040;
+  --warn: #f0a020;
   --red: #f06060;
   --text: #e2e6f0;
   --text2: #8892a4;
+  --text3: #5c6578;
   --radius: 8px;
   --sidebar-w: 200px;
   --font: 'SF Pro Display', 'Segoe UI', system-ui, sans-serif;
@@ -178,8 +180,6 @@ body {
 @keyframes spin { to { transform: rotate(360deg); } }
 
 /* ── Progress bar ───────────────────────────────────────────── */
-.progress-wrap { display: flex; flex-direction: column; gap: 6px; }
-.progress-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text2); }
 .progress-bar {
   height: 6px; background: var(--bg3); border-radius: 99px; overflow: hidden;
 }
