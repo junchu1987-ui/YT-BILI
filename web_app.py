@@ -320,15 +320,31 @@ def run_scan():
         for s in sources:
             if S['cancel_flag']: break
             url = s['url']
+
+            # Strip YouTube Radio Mix playlist params (list=RD...) — treat as single video
+            # Radio mixes expand to 25-50+ videos and trigger rate limiting rapidly
+            from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+            parsed = urlparse(url)
+            qs = parse_qs(parsed.query, keep_blank_values=True)
+            list_val = qs.get('list', [''])[0]
+            if list_val.startswith('RD'):
+                vid_id = qs.get('v', [''])[0]
+                if vid_id:
+                    url = f"https://www.youtube.com/watch?v={vid_id}"
+                    log_to_web('info', f"Radio Mix URL 已简化为单视频: {url}")
+
             log_to_web('info', f"扫描中: {url}")
 
             ydl_opts = {
                 'quiet': True,
                 'no_warnings': True,
-                'extract_flat': False, # Fetch full info for filesize data
+                'extract_flat': False,   # Fetch full info for filesize data
                 'proxy': cfg['app'].get('proxy'),
                 'js_runtimes': _js_runtimes(),
                 'cookiefile': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'youtube_cookies.txt'),
+                'playlistend': 30,       # Cap playlist scans to 30 most recent
+                'sleep_interval': 1,     # 1s delay between requests to avoid rate limiting
+                'max_sleep_interval': 3,
             }
             with YoutubeDL(ydl_opts) as ydl:
                 try:
