@@ -96,10 +96,21 @@ body {
   flex-direction: column;
 }
 
-.tab-panel { display: none; flex-direction: column; gap: 20px; height: 100%; min-height: 0; }
+.tab-panel { display: none; flex-direction: column; gap: 0; height: 100%; min-height: 0; }
 .tab-panel.active { display: flex; }
 /* Non-pipeline tabs scroll themselves */
-.tab-panel.active:not(#tab-pipeline) { overflow-y: auto; }
+.tab-panel.active:not(#tab-pipeline) { overflow-y: auto; gap: 20px; }
+
+/* Pipeline: scrollable top half + fixed log at bottom */
+.pipeline-scroll {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding-bottom: 16px;
+}
 
 .page-header {
   display: flex;
@@ -200,9 +211,7 @@ body {
 
 /* ── Video list ─────────────────────────────────────────────── */
 #video-list-section {
-  overflow-y: auto;
-  min-height: 0;
-  flex-shrink: 1;
+  flex-shrink: 0;
 }
 .video-list { display: flex; flex-direction: column; gap: 6px; flex-shrink: 0; }
 
@@ -377,8 +386,9 @@ a.bili-check-link { text-decoration: none; cursor: pointer; }
 
 /* ── Log panel ──────────────────────────────────────────────── */
 .log-section {
-  flex: 1;
-  min-height: 160px;
+  flex-shrink: 0;
+  height: 220px;
+  margin-top: 16px;
   display: flex;
   flex-direction: column;
   background: var(--bg2);
