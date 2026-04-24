@@ -797,6 +797,17 @@ def run_transcode():
                 res = processor.process(video_data, cancel_check=check_cancel, progress_cb=transcode_progress)
 
                 if res:
+                    # Normalize output filename to {safe_title}_final.mp4.
+                    # video_processor derives its output name from the input filepath,
+                    # which may include yt-dlp format codes (e.g. .f401), producing
+                    # a mismatch with the {safe_title}_final.mp4 that upload code expects.
+                    expected_final = os.path.join(
+                        cfg['app']['work_dir'], vid_dir_name, f"{safe_title}_final.mp4"
+                    )
+                    if res != expected_final and os.path.isfile(res):
+                        os.replace(res, expected_final)
+                        res = expected_final
+
                     # Secondary validation: ensure _final.mp4 is playable
                     if not os.path.isfile(res) or os.path.getsize(res) < 1024 * 1024:
                         raise Exception(f"转码输出文件缺失或过小: {res}")
