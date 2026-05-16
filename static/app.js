@@ -1,6 +1,28 @@
 /* app.js — YT→Bilibili Web UI */
 'use strict';
 
+// ── schedule_time helpers ─────────────────────────────────────────────────────
+// schedule_time is stored as Unix timestamp (integer seconds).
+// Legacy entries may be ISO strings — normalise on read.
+function schedTimeToDate(v) {
+  if (!v) return null;
+  if (typeof v === 'number') return new Date(v * 1000);
+  // ISO string fallback
+  const d = new Date(v);
+  return isNaN(d) ? null : d;
+}
+// Returns "YYYY-MM-DDTHH:MM" in local time for datetime-local inputs
+function schedTimeToInputVal(v) {
+  const d = schedTimeToDate(v);
+  if (!d) return '';
+  return new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+}
+// Converts datetime-local input value to Unix timestamp
+function inputValToUnix(s) {
+  if (!s) return null;
+  return Math.floor(new Date(s).getTime() / 1000);
+}
+
 // ── State ─────────────────────────────────────────────────────────────────────
 const S = {
   status: 'idle',
@@ -113,30 +135,13 @@ function connectSSE() {
     updateProgress(d.id, d.pct, d.message);
   });
   es.addEventListener('log', e => {
-    const d = JSON.parse(e.data);
-    appendLog(d.ts, d.level, d.message);
+    // log events suppressed (log panel removed)
   });
   es.onerror = () => {
     setTimeout(() => { es.close(); connectSSE(); }, 3000);
   };
 }
 
-// ── Log panel ─────────────────────────────────────────────────────────────────
-const logBody = document.getElementById('log-body');
-
-function appendLog(ts, level, msg) {
-  const line = document.createElement('div');
-  line.className = 'log-line';
-  line.innerHTML = `<span class="log-ts">${ts}</span><span class="log-msg ${level}">${escHtml(msg)}</span>`;
-  logBody.appendChild(line);
-  logBody.scrollTop = logBody.scrollHeight;
-  // Keep max 400 lines
-  while (logBody.children.length > 400) logBody.removeChild(logBody.firstChild);
-}
-
-document.getElementById('btn-clear-log').addEventListener('click', () => {
-  logBody.innerHTML = '';
-});
 
 document.getElementById('btn-reset').addEventListener('click', async () => {
   if (!confirm('重置流水线？已下载但未上传的进度不会丢失。')) return;
@@ -465,6 +470,7 @@ function renderVideoSection() {
 
     if (showDelBtn) {
         itemRow.querySelector('.btn-del-meta').addEventListener('click', () => {
+            if (!confirm('确定从队列中移除该视频？\n（若该视频的来源 URL 不属于其他视频，来源也将被同步删除）')) return;
             fetch(`/api/video_meta/${c.id}`, { method: 'DELETE' }).catch(() => {});
         });
     }
@@ -492,9 +498,9 @@ function renderVideoSection() {
         if (c.with_subtitles === undefined) c.with_subtitles = true;
         if (c.auto_upload    === undefined) c.auto_upload    = false;
 
-        const toLocal = d => new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-        const minDt = toLocal(new Date(Date.now() + 4 * 3600 * 1000 + 60000));
-        const existingSched = S.videoMeta[c.id]?.schedule_time || '';
+        const minDt = schedTimeToInputVal(Math.floor((Date.now() + 4 * 3600 * 1000 + 60000) / 1000));
+        const existingSched = S.videoMeta[c.id]?.schedule_time
+            ? schedTimeToInputVal(S.videoMeta[c.id].schedule_time) : '';
 
         const optRow = document.createElement('div');
         optRow.className = 'prescan-options-row';
@@ -520,8 +526,9 @@ function renderVideoSection() {
         const clearBtn = optRow.querySelector('.sched-clear-btn');
         dtInput.addEventListener('change', () => {
             if (!S.videoMeta[c.id]) S.videoMeta[c.id] = {};
-            S.videoMeta[c.id].schedule_time = dtInput.value || null;
-            api('POST', `/api/prescan_meta/${c.id}`, { schedule_time: dtInput.value || null }).catch(() => {});
+            const unix = inputValToUnix(dtInput.value);
+            S.videoMeta[c.id].schedule_time = unix;
+            api('POST', `/api/prescan_meta/${c.id}`, { schedule_time: unix }).catch(() => {});
         });
         clearBtn.addEventListener('click', () => {
             dtInput.value = '';
@@ -629,15 +636,10 @@ function renderVideoSection() {
                 : [...S.defaultTags];
         }
         const m = S.videoMeta[c.id];
-        // Default datetime for scheduled publish: now + 5 hours (biliup requires >4h)
-        const defaultDt = new Date(Date.now() + 5 * 3600 * 1000);
-        const defaultDtLocal = new Date(defaultDt - defaultDt.getTimezoneOffset() * 60000)
-            .toISOString().slice(0, 16);
-        const minDt = new Date(Date.now() + 4 * 3600 * 1000 + 60000);
-        const minDtLocal = new Date(minDt - minDt.getTimezoneOffset() * 60000)
-            .toISOString().slice(0, 16);
         const isScheduled = !!m.schedule_time;
-        const editor = document.createElement('div');
+        const defaultDtUnix = Math.floor((Date.now() + 5 * 3600 * 1000) / 1000);
+        const minDtLocal = schedTimeToInputVal(Math.floor((Date.now() + 4 * 3600 * 1000 + 60000) / 1000));
+        const scheduledInputVal = m.schedule_time ? schedTimeToInputVal(m.schedule_time) : schedTimeToInputVal(defaultDtUnix);
         editor.className = 'upload-meta-editor' + (metaExp ? '' : ' collapsed');
         editor.innerHTML = `
           <div class="meta-field">
@@ -687,7 +689,7 @@ function renderVideoSection() {
               </label>
               <div class="schedule-dt-wrap" style="${isScheduled ? '' : 'display:none'}">
                 <input type="datetime-local" class="meta-schedule-dt"
-                       value="${m.schedule_time ? m.schedule_time.slice(0,16) : defaultDtLocal}"
+                       value="${scheduledInputVal}"
                        min="${minDtLocal}">
                 <span class="schedule-hint">⚠ 需距现在4小时以上</span>
               </div>
@@ -745,7 +747,7 @@ function renderVideoSection() {
                 if (radio.value === 'scheduled') {
                     dtWrap.style.display = '';
                     const dtInput = editor.querySelector('.meta-schedule-dt');
-                    S.videoMeta[c.id].schedule_time = dtInput.value || defaultDtLocal;
+                    S.videoMeta[c.id].schedule_time = inputValToUnix(dtInput.value) || defaultDtUnix;
                 } else {
                     dtWrap.style.display = 'none';
                     S.videoMeta[c.id].schedule_time = null;
@@ -754,7 +756,7 @@ function renderVideoSection() {
             });
         });
         editor.querySelector('.meta-schedule-dt').addEventListener('change', e => {
-            S.videoMeta[c.id].schedule_time = e.target.value || null;
+            S.videoMeta[c.id].schedule_time = inputValToUnix(e.target.value);
             scheduleMetaSave(c.id);
         });
         editor.querySelector('.meta-desc').addEventListener('input', e => {
@@ -843,6 +845,129 @@ function renderVideoSection() {
         });
     }
   }
+  renderScheduleCalendar();
+}
+
+// ── Pipeline schedule calendar ────────────────────────────────────────────────
+const SchedCal = { weekOffset: 0 };
+const SCHED_SLOTS = [12, 18, 22]; // fixed time slots (hours)
+
+function renderScheduleCalendar() {
+  const section = document.getElementById('sched-cal-section');
+  if (!section) return;
+
+  // Show only when there are pending (not yet uploaded) videos with schedule_time
+  const pending = Object.entries(S.videoMeta || {})
+    .filter(([, m]) => !m.uploaded && m.schedule_time);
+  if (!pending.length) { section.style.display = 'none'; return; }
+  section.style.display = '';
+
+  const sun = calWeekSunday(SchedCal.weekOffset);
+  const sat = new Date(sun); sat.setDate(sun.getDate() + 6);
+  const fmt = d => `${d.getMonth()+1}月${d.getDate()}日`;
+  document.getElementById('sched-cal-label').textContent =
+    `${fmt(sun)} – ${fmt(sat)}`;
+
+  const grid = document.getElementById('sched-cal-grid');
+  grid.innerHTML = '';
+
+  const todayStr = (() => { const t = new Date(); t.setHours(0,0,0,0); return t.toDateString(); })();
+
+  // Header row: empty gutter + 7 days
+  const gutter = document.createElement('div');
+  gutter.className = 'sched-cal-gutter';
+  grid.appendChild(gutter);
+  const days = [];
+  for (let d = 0; d < 7; d++) {
+    const dt = new Date(sun); dt.setDate(sun.getDate() + d);
+    days.push(dt);
+    const isToday = dt.toDateString() === todayStr;
+    const hdr = document.createElement('div');
+    hdr.className = 'sched-cal-header' + (isToday ? ' today' : '');
+    hdr.innerHTML = `<span class="cal-date-num">${dt.getDate()}</span>${CAL_DAY_NAMES[d]}`;
+    grid.appendChild(hdr);
+  }
+
+  // Build slot map: "YYYY-MM-DD|H" -> [{vid, m}]
+  const slotMap = {};
+  pending.forEach(([vid, m]) => {
+    const dt = schedTimeToDate(m.schedule_time);
+    if (!dt) return;
+    const dateKey = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+    const key = `${dateKey}|${dt.getHours()}`;
+    if (!slotMap[key]) slotMap[key] = [];
+    slotMap[key].push({ vid, m, dt });
+  });
+
+  // Slot rows: one per fixed time slot
+  SCHED_SLOTS.forEach(h => {
+    const label = document.createElement('div');
+    label.className = 'sched-cal-slot-label';
+    label.textContent = `${String(h).padStart(2,'0')}:00`;
+    grid.appendChild(label);
+
+    for (let d = 0; d < 7; d++) {
+      const dt = days[d];
+      const isToday = dt.toDateString() === todayStr;
+      const dateKey = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
+      const cell = document.createElement('div');
+      cell.className = 'sched-cal-cell' + (isToday ? ' today-col' : '');
+      cell.dataset.date = dateKey;
+      cell.dataset.hour = h;
+
+      // Drag-over target
+      cell.addEventListener('dragover', e => { e.preventDefault(); cell.classList.add('drag-over'); });
+      cell.addEventListener('dragleave', () => cell.classList.remove('drag-over'));
+      cell.addEventListener('drop', async e => {
+        e.preventDefault();
+        cell.classList.remove('drag-over');
+        const vid = e.dataTransfer.getData('text/plain');
+        if (!vid) return;
+        // Compute new Unix timestamp for this slot
+        const [y, mo, day2] = cell.dataset.date.split('-').map(Number);
+        const newDt = new Date(y, mo - 1, day2, parseInt(cell.dataset.hour), 0, 0, 0);
+        const unix = Math.floor(newDt.getTime() / 1000);
+        if (!S.videoMeta[vid]) S.videoMeta[vid] = {};
+        S.videoMeta[vid].schedule_time = unix;
+        await api('POST', `/api/prescan_meta/${vid}`, { schedule_time: unix });
+        renderScheduleCalendar();
+      });
+
+      (slotMap[`${dateKey}|${h}`] || []).forEach(ev => {
+        const card = document.createElement('div');
+        card.className = 'sched-cal-card';
+        card.draggable = true;
+        card.dataset.vid = ev.vid;
+        card.innerHTML = `
+          <img src="/api/thumb/${ev.vid}" alt="" loading="lazy">
+          <span class="sched-cal-card-title">${escHtml((ev.m.title || ev.vid).slice(0, 28))}</span>
+          <button class="sched-cal-card-del" title="清除定时" data-vid="${ev.vid}">✕</button>`;
+        card.addEventListener('dragstart', e => {
+          e.dataTransfer.setData('text/plain', ev.vid);
+          card.classList.add('dragging');
+        });
+        card.addEventListener('dragend', () => card.classList.remove('dragging'));
+        card.querySelector('.sched-cal-card-del').addEventListener('click', async e => {
+          e.stopPropagation();
+          if (!S.videoMeta[ev.vid]) S.videoMeta[ev.vid] = {};
+          S.videoMeta[ev.vid].schedule_time = null;
+          await api('POST', `/api/prescan_meta/${ev.vid}`, { schedule_time: null });
+          renderScheduleCalendar();
+        });
+        cell.appendChild(card);
+      });
+
+      grid.appendChild(cell);
+    }
+  });
+
+  // Nav button bindings (attach once)
+  const prevBtn = document.getElementById('sched-cal-prev');
+  const nextBtn = document.getElementById('sched-cal-next');
+  const todayBtn = document.getElementById('sched-cal-today');
+  if (prevBtn)  prevBtn.onclick  = () => { SchedCal.weekOffset--; renderScheduleCalendar(); };
+  if (nextBtn)  nextBtn.onclick  = () => { SchedCal.weekOffset++; renderScheduleCalendar(); };
+  if (todayBtn) todayBtn.onclick = () => { SchedCal.weekOffset = 0; renderScheduleCalendar(); };
 }
 
 function updateProgress(videoId, pct, msg) {
@@ -924,9 +1049,7 @@ async function doTranslate() {
 
 async function doRescan() {
   const r = await api('POST', '/api/video_meta/rescan');
-  const ts = new Date().toLocaleTimeString('zh-CN', {hour12: false});
-  if (r && r.added > 0) appendLog(ts, 'info', `重新扫描完成，新增 ${r.added} 个视频到上传队列`);
-  else appendLog(ts, 'info', '重新扫描完成，没有发现新视频');
+  if (r && r.added > 0) alert(`重新扫描完成，新增 ${r.added} 个视频到上传队列`);
 }
 async function doRetry(id)     { await api('POST', '/api/retry', { video_id: id }); }
 
@@ -935,25 +1058,54 @@ function showScheduleModal() {
   const ids = [...selectedIds].filter(id => !S.candidates.find(c => c.id === id)?.already_downloaded);
   if (!ids.length) { alert('请先勾选要排班的视频'); return; }
 
+  // Fixed slots: 12:00, 18:00, 22:00 — find next available slot from now
+  const SLOTS = [12, 18, 22]; // hours
+  const now = new Date();
+
+  // Build ordered list of upcoming slots starting from next available
+  function nextSlots(count) {
+    const result = [];
+    const d = new Date(now);
+    d.setSeconds(0, 0);
+    // Start searching from today; advance until we have enough slots
+    for (let dayOffset = 0; result.length < count; dayOffset++) {
+      const day = new Date(now);
+      day.setDate(now.getDate() + dayOffset);
+      day.setSeconds(0, 0);
+      for (const h of SLOTS) {
+        day.setHours(h, 0, 0, 0);
+        // Must be >4h from now (biliup requirement)
+        if (day.getTime() - now.getTime() > 4 * 3600 * 1000) {
+          result.push(new Date(day));
+          if (result.length >= count) break;
+        }
+      }
+    }
+    return result;
+  }
+
+  const slots = nextSlots(ids.length);
+  const fmt = d => `${d.getMonth()+1}月${d.getDate()}日 ${String(d.getHours()).padStart(2,'0')}:00`;
+
   const existing = document.getElementById('schedule-modal');
   if (existing) existing.remove();
-
-  const defaultStart = new Date(Date.now() + 5 * 3600 * 1000);
-  const toLocal = d => new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
 
   const modal = document.createElement('div');
   modal.id = 'schedule-modal';
   modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center';
   modal.innerHTML = `
-    <div style="background:var(--bg2);border-radius:12px;padding:24px;min-width:320px;box-shadow:0 8px 32px rgba(0,0,0,.4)">
-      <div style="font-weight:600;margin-bottom:16px">📅 自动排班（${ids.length} 个视频）</div>
-      <div class="meta-field" style="margin-bottom:12px">
-        <label>起始时间</label>
-        <input type="datetime-local" id="sched-start" value="${toLocal(defaultStart)}" style="width:100%">
-      </div>
-      <div class="meta-field" style="margin-bottom:16px">
-        <label>间隔（分钟）</label>
-        <input type="number" id="sched-interval" value="120" min="10" style="width:120px">
+    <div style="background:var(--bg2);border-radius:12px;padding:24px;min-width:340px;max-height:80vh;overflow-y:auto;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div style="font-weight:600;margin-bottom:12px">📅 自动排班（${ids.length} 个视频）</div>
+      <div style="font-size:12px;color:var(--text2);margin-bottom:16px">时间槽固定为每天 12:00 / 18:00 / 22:00，从最近可用时间起顺序分配</div>
+      <div style="display:flex;flex-direction:column;gap:6px;margin-bottom:16px">
+        ${ids.map((id, i) => {
+          const m = S.videoMeta[id] || {};
+          const title = escHtml((m.title || id).slice(0, 30));
+          return `<div style="display:flex;align-items:center;gap:10px;font-size:12px">
+            <span style="color:var(--text2);min-width:110px">${fmt(slots[i])}</span>
+            <span style="color:var(--text)">${title}</span>
+          </div>`;
+        }).join('')}
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end">
         <button class="btn btn-ghost" onclick="document.getElementById('schedule-modal').remove()">取消</button>
@@ -961,31 +1113,29 @@ function showScheduleModal() {
       </div>
     </div>`;
   document.body.appendChild(modal);
+  // Store computed slots for applySchedule
+  modal._slots = slots;
+  modal._ids = ids;
 }
 
 async function applySchedule() {
-  const startInput = document.getElementById('sched-start');
-  const intervalInput = document.getElementById('sched-interval');
-  if (!startInput || !intervalInput) return;
+  const modal = document.getElementById('schedule-modal');
+  if (!modal) return;
+  const slots = modal._slots;
+  const ids = modal._ids;
+  if (!slots || !ids) return;
 
-  const startMs = new Date(startInput.value).getTime();
-  const intervalMs = (parseInt(intervalInput.value) || 120) * 60 * 1000;
-  if (isNaN(startMs)) { alert('请输入有效的起始时间'); return; }
-
-  const ids = [...selectedIds].filter(id => !S.candidates.find(c => c.id === id)?.already_downloaded);
   const promises = ids.map((id, i) => {
-    const dt = new Date(startMs + i * intervalMs);
-    const isoLocal = new Date(dt - dt.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    const tsUnix = Math.floor(slots[i].getTime() / 1000); // Unix timestamp (seconds)
     if (!S.videoMeta[id]) S.videoMeta[id] = {};
-    S.videoMeta[id].schedule_time = isoLocal;
-    return api('POST', `/api/prescan_meta/${id}`, { schedule_time: isoLocal });
+    S.videoMeta[id].schedule_time = tsUnix;
+    return api('POST', `/api/prescan_meta/${id}`, { schedule_time: tsUnix });
   });
   await Promise.all(promises);
 
-  document.getElementById('schedule-modal')?.remove();
+  modal.remove();
   renderVideoSection();
-  const ts = new Date().toLocaleTimeString('zh-CN', {hour12: false});
-  appendLog(ts, 'info', `已为 ${ids.length} 个视频分配定时发布时间`);
+  renderScheduleCalendar();
 }
 
 // ── Sources tab ───────────────────────────────────────────────────────────────
@@ -1019,29 +1169,49 @@ async function loadSources() {
 document.getElementById('btn-add-source').addEventListener('click', async () => {
   const input = document.getElementById('new-source-url');
   const btn = document.getElementById('btn-add-source');
-  const url = input.value.trim();
-  if (!url) return;
-  
-  // Provide loading feedback since fetching title takes a few seconds
+
+  // Extract all non-empty URLs from textarea (one per line)
+  const urls = input.value.split('\n').map(l => l.trim()).filter(l => l.length > 0);
+  if (!urls.length) return;
+
   btn.disabled = true;
-  btn.textContent = '获取信息...';
-  
-  const res = await api('POST', '/api/sources', { url });
-  
+  let totalCandidates = 0;
+  const errors = [];
+
+  for (let i = 0; i < urls.length; i++) {
+    btn.textContent = `扫描中 ${i + 1}/${urls.length}...`;
+    const res = await api('POST', '/api/sources', { url: urls[i] });
+    if (res && res.error) {
+      errors.push(`${urls[i]}: ${res.error}`);
+    } else if (res) {
+      totalCandidates += res.candidates || 0;
+      if (res.skipped > 0) {
+        errors.push(`${urls[i]}: ${res.skipped} 个视频已上传过，未加入列表${res.all_skipped ? '（来源未保存）' : ''}`);
+      }
+    }
+  }
+
   btn.disabled = false;
   btn.textContent = '➕ 添加';
-  
-  if (res && res.error) {
-    alert('添加失败: ' + res.error);
-    return;
+
+  if (errors.length) {
+    alert('以下来源添加失败:\n' + errors.join('\n'));
   }
-  
+
   input.value = '';
   loadSources();
+  if (totalCandidates > 0) {
+    document.querySelectorAll('.nav-link').forEach(l => l.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelector('.nav-link[data-tab="pipeline"]').classList.add('active');
+    document.getElementById('tab-pipeline').classList.add('active');
+    // SSE will push the updated state; renderPipeline fires automatically via the state listener
+  }
 });
 
+// textarea: Enter adds newline naturally; Ctrl+Enter triggers add
 document.getElementById('new-source-url').addEventListener('keydown', e => {
-  if (e.key === 'Enter') document.getElementById('btn-add-source').click();
+  if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) document.getElementById('btn-add-source').click();
 });
 
 async function deleteSource(idx) {
@@ -1116,6 +1286,7 @@ document.addEventListener('DOMContentLoaded', () => {
   document.getElementById('cfg-tag-input').addEventListener('keydown', e => {
     if (e.key === 'Enter') { e.preventDefault(); addCfgTag(); }
   });
+  loadSources();
 });
 async function loadSettings() {
   const cfg = await api('GET', '/api/config');

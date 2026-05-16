@@ -68,6 +68,9 @@ S = {
     },
 }
 
+# Active pipeline download queue (set by run_pipeline, allows dynamic video injection)
+_pipeline_download_q = None
+
 def reset_pipeline():
     with state_lock:
         S['status'] = 'idle'
@@ -270,7 +273,12 @@ def _queue_for_upload(c):
         S['video_meta'][vid] = meta[vid]
 
 def restore_state():
-    """On startup, restore S['transcoded'] from video_meta.json."""
+    """On startup, restore pipeline state from video_meta.json.
+    - scan_done / download pending/running → restore as candidates
+    - download done / transcode pending/running → restore as downloaded (retryable)
+    - transcode done → restore as transcoded (ready to upload)
+    - running stages are reset to pending (crash recovery)
+    """
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
     if not os.path.isdir(work_dir):
@@ -290,47 +298,105 @@ def restore_state():
 
     scan_cache = _load_scan_cache(work_dir)
 
-    restored = []
+    candidates_restored = []
+    downloaded_restored = []
+    transcoded_restored = []
     dirty = False
+
     for vid, m in list(meta.items()):
         if m.get('uploaded'):
             continue
-        lp = m.get('local_path', '')
-        # Resolve relative paths against the app's own directory
-        if lp and not os.path.isabs(lp):
-            lp = os.path.join(os.path.dirname(os.path.abspath(__file__)), lp)
-        if not lp or not os.path.isfile(lp) or os.path.getsize(lp) < 1024 * 1024:
-            logging.info(f"restore_state: {vid} local_path missing or too small, removing from queue")
-            del meta[vid]
+
+        stages = m.get('stages', {})
+        scan_st   = stages.get('scan',      {}).get('status', 'pending')
+        dl_st     = stages.get('download',  {}).get('status', 'pending')
+        tc_st     = stages.get('transcode', {}).get('status', 'pending')
+
+        # Reset any "running" stages to "pending" (crash recovery)
+        if dl_st == 'running':
+            meta[vid]['stages']['download']['status'] = 'pending'
+            dl_st = 'pending'
             dirty = True
-            continue
-        restored.append({
+        if tc_st == 'running':
+            meta[vid]['stages']['transcode']['status'] = 'pending'
+            tc_st = 'pending'
+            dirty = True
+        tr_st = stages.get('translate', {}).get('status', 'pending')
+        if tr_st == 'running':
+            meta[vid]['stages']['translate']['status'] = 'pending'
+            dirty = True
+
+        c = {
             'id': vid,
             'title': m.get('original_title') or m.get('title', ''),
             'translated_title': m.get('title', ''),
             'description': scan_cache.get(vid, {}).get('description', ''),
             'url': m.get('url', f'https://www.youtube.com/watch?v={vid}'),
             'url_type': 'video',
-            'already_downloaded': True,
-            'formats': [],
-            'rec_format_id': None,
-            'local_path': lp,
-            'local_dir': os.path.dirname(lp),
+            'already_downloaded': False,
+            'formats': scan_cache.get(vid, {}).get('formats', []),
+            'rec_format_id': scan_cache.get(vid, {}).get('rec_format_id'),
             'original_thumbnail': m.get('original_thumbnail'),
-        })
+        }
+
+        if tc_st == 'done':
+            # Transcoded: verify local file exists
+            lp = m.get('local_path', '')
+            if lp and not os.path.isabs(lp):
+                lp = os.path.join(os.path.dirname(os.path.abspath(__file__)), lp)
+            if not lp or not os.path.isfile(lp) or os.path.getsize(lp) < 1024 * 1024:
+                logging.info(f"restore_state: {vid} transcode_done but local_path missing, downgrading to candidate")
+                # Downgrade - treat as scan_done candidate
+                meta[vid]['stages']['transcode']['status'] = 'pending'
+                meta[vid]['stages']['download']['status'] = 'pending'
+                dirty = True
+                candidates_restored.append(c)
+            else:
+                c['already_downloaded'] = True
+                c['local_path'] = lp
+                c['local_dir'] = os.path.dirname(lp)
+                transcoded_restored.append(c)
+                downloaded_restored.append(c)
+
+        elif dl_st == 'done':
+            # Downloaded but not transcoded
+            lp = m.get('local_path', '')
+            if lp and not os.path.isabs(lp):
+                lp = os.path.join(os.path.dirname(os.path.abspath(__file__)), lp)
+            if lp and os.path.isfile(lp) and os.path.getsize(lp) >= 1024 * 1024:
+                c['already_downloaded'] = True
+                c['local_path'] = lp
+                c['local_dir'] = os.path.dirname(lp)
+                downloaded_restored.append(c)
+            else:
+                # File gone, reset download stage
+                meta[vid]['stages']['download']['status'] = 'pending'
+                dirty = True
+                candidates_restored.append(c)
+
+        elif scan_st == 'done':
+            # Scan done, not yet downloaded
+            candidates_restored.append(c)
 
     if dirty:
         _save_video_meta(work_dir, meta)
 
-    if restored:
+    if transcoded_restored or downloaded_restored or candidates_restored:
         with state_lock:
-            S['transcoded'] = restored
-            S['downloaded'] = list(restored)
-            S['status'] = 'pipeline_done'
-            S['video_meta'] = {
-                vid: m for vid, m in meta.items() if not m.get('uploaded')
-            }
-        logging.info(f"State restored from video_meta.json: {len(restored)} videos.")
+            S['candidates']  = candidates_restored
+            S['downloaded']  = downloaded_restored
+            S['transcoded']  = transcoded_restored
+            S['video_meta']  = {vid: m for vid, m in meta.items() if not m.get('uploaded')}
+            if transcoded_restored:
+                S['status'] = 'pipeline_done'
+            elif downloaded_restored:
+                S['status'] = 'download_done'
+            elif candidates_restored:
+                S['status'] = 'scan_done'
+        logging.info(
+            f"State restored: {len(candidates_restored)} candidates, "
+            f"{len(downloaded_restored)} downloaded, {len(transcoded_restored)} transcoded."
+        )
 
 # ── Pipeline Core ─────────────────────────────────────────────────────────────
 def run_scan():
@@ -646,6 +712,7 @@ def _download_one(vid_entry, cfg):
     c['auto_upload'] = vid_entry.get('auto_upload', False)
 
     log_to_web('info', f"开始下载 [{format_id or quality}]: {c['title']}", vid)
+    _update_stage(work_dir, vid, 'download', 'running')
 
     safe_title = slugify(c['title'])
     vid_dir = os.path.join(work_dir, f"{safe_title}_{vid[:8]}")
@@ -769,6 +836,7 @@ def _download_one(vid_entry, cfg):
 
             with state_lock:
                 S['downloaded'].append(c)
+            _update_stage(work_dir, vid, 'download', 'done')
             log_to_web('info', f"成功下载并识别: {os.path.basename(found_video)}", vid)
             return c
         else:
@@ -780,11 +848,13 @@ def _download_one(vid_entry, cfg):
             log_to_web('warning', f"⚠ 年龄限制视频，跳过下载: {vid}", vid)
             with state_lock:
                 S['errors'].append({'id': vid, 'step': 'download', 'message': '年龄限制视频，无法下载'})
+            _update_stage(work_dir, vid, 'download', 'failed')
         else:
             log_to_web('error', f"下载阶段异常: {err_str}", vid)
             with state_lock:
                 S['errors'].append({'id': vid, 'step': 'download', 'message': err_str})
             log_to_web('error', f"下载失败: {err_str}", vid)
+            _update_stage(work_dir, vid, 'download', 'failed')
         return None
 
 
@@ -811,6 +881,7 @@ def _transcode_one(c, processor, cfg):
     """Transcode one video. Returns True on success, False on failure."""
     vid = c['id']
     log_to_web('info', f"启动转码流程: {c['title']}", vid)
+    _update_stage(cfg['app']['work_dir'], vid, 'transcode', 'running')
 
     safe_title = slugify(c['title'])
     vid_dir_name = f"{safe_title}_{vid[:8]}"
@@ -877,6 +948,7 @@ def _translate_one(c, cfg, cover_proc, desc_prefix):
     work_dir = cfg['app']['work_dir']
 
     log_to_web('info', f"翻译标题: {c['title']}", vid)
+    _update_stage(work_dir, vid, 'translate', 'running')
     try:
         translated = cover_proc.translate_title(c['title'])
         if translated and translated != c['title']:
@@ -966,13 +1038,19 @@ def _do_upload_single(vid, c, uploader, cfg):
     else:
         tags_override = [t.strip() for t in str(tags_raw).split(',') if t.strip()] or None
     dtime_override = None
-    schedule_time_str = meta.get('schedule_time')
-    if schedule_time_str:
+    schedule_time_raw = meta.get('schedule_time')
+    if schedule_time_raw:
         try:
-            dt = datetime.fromisoformat(schedule_time_str)
-            dtime_override = int(dt.timestamp())
+            if isinstance(schedule_time_raw, (int, float)):
+                # Unix timestamp (seconds) — preferred format, no timezone ambiguity
+                dtime_override = int(schedule_time_raw)
+            else:
+                # Legacy ISO string (naive local time) — fromisoformat gives naive datetime,
+                # .timestamp() converts using local timezone (correct on same machine)
+                dt = datetime.fromisoformat(str(schedule_time_raw))
+                dtime_override = int(dt.timestamp())
         except Exception as e:
-            log_to_web('warn', f"无法解析定时时间 '{schedule_time_str}': {e}", vid)
+            log_to_web('warn', f"无法解析定时时间 '{schedule_time_raw}': {e}", vid)
     copyright_override = int(meta['copyright']) if meta.get('copyright') in (1, 2, '1', '2') else None
     source_override = meta.get('source') or None
     desc_override = meta.get('desc') or None
@@ -1190,6 +1268,8 @@ def run_pipeline(video_ids):
             }
 
         download_q = Queue()
+        global _pipeline_download_q
+        _pipeline_download_q = download_q
         transcode_q = Queue()
         translate_q = Queue()
         upload_q = Queue()
@@ -1220,6 +1300,8 @@ def run_pipeline(video_ids):
         log_to_web('error', f"流水线崩溃: {str(e)}")
         update_state('scan_done')
     finally:
+        global _pipeline_download_q
+        _pipeline_download_q = None
         _allow_sleep()
 
 # ── History Persistence ──────────────────────────────────────────────────────
@@ -1328,14 +1410,31 @@ def delete_video_meta(vid):
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
     meta = _load_video_meta(work_dir)
+
+    # Find the source URL for this video before deleting
+    source_url = None
     if vid in meta:
+        source_url = meta[vid].get('url') or meta[vid].get('source')
         del meta[vid]
         _save_video_meta(work_dir, meta)
+
+    # Remove the source URL from config.yaml if it's a single-video source
+    if source_url:
+        with _config_lock:
+            cfg2 = load_config()
+            sources = cfg2['youtube'].get('sources', [])
+            new_sources = [s for s in sources if s['url'] != source_url]
+            if len(new_sources) < len(sources):
+                cfg2['youtube']['sources'] = new_sources
+                save_config(cfg2)
+
     with state_lock:
         S['video_meta'].pop(vid, None)
         S['transcoded'] = [x for x in S['transcoded'] if x['id'] != vid]
+        S['downloaded']  = [x for x in S['downloaded']  if x['id'] != vid]
+        S['candidates']  = [x for x in S['candidates']  if x['id'] != vid]
     update_state()
-    return jsonify({'ok': True})
+    return jsonify({'ok': True, 'source_removed': source_url is not None})
 
 @app.route('/api/video_meta/<vid>/stages', methods=['POST'])
 def update_stages(vid):
@@ -1570,6 +1669,23 @@ def trigger_pipeline():
     return jsonify({'ok': True})
 
 
+@app.route('/api/pipeline/add', methods=['POST'])
+def pipeline_add():
+    """动态向正在运行的流水线追加视频。body: {video_ids: [{id, ...}, ...]}"""
+    if not S.get('pipeline_active') or _pipeline_download_q is None:
+        return jsonify({'error': 'Pipeline not running'}), 400
+    data = request.json or {}
+    video_ids = data.get('video_ids', [])
+    if not video_ids:
+        return jsonify({'error': 'No video IDs provided'}), 400
+    for vid_entry in video_ids:
+        _pipeline_download_q.put(vid_entry)
+        with state_lock:
+            S['pipeline_counts']['download']['queued'] += 1
+    update_state()
+    return jsonify({'ok': True, 'added': len(video_ids)})
+
+
 @app.route('/api/prescan_meta/<vid>', methods=['POST'])
 def prescan_meta(vid):
     """扫描阶段保存定时/元数据预设，下载开始前调用。"""
@@ -1781,22 +1897,187 @@ def add_source():
         if any(s['url'] == url for s in cfg['youtube']['sources']):
             return jsonify({'error': 'Already exists'}), 400
 
-        # Get Title (Optional helper)
-        title = url
-        try:
-            from yt_dlp import YoutubeDL
-            with YoutubeDL({'quiet':True, 'extract_flat':True, 'proxy':cfg['app'].get('proxy'), 'js_runtimes':_js_runtimes()}) as ydl:
-                info = ydl.extract_info(url, download=False)
-                title = info.get('title', url)
-        except: pass
+    # Full scan outside the lock (may take several seconds)
+    cfg = load_config()
+    title = url
+    new_candidates = []
+    try:
+        from yt_dlp import YoutubeDL
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'extract_flat': False,
+            'proxy': cfg['app'].get('proxy'),
+            'js_runtimes': _js_runtimes(),
+            'cookiefile': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'youtube_cookies.txt'),
+            'playlistend': 30,
+        }
+        with YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            title = info.get('title', url)
+            entries = info.get('entries', [info])
+            work_dir = cfg['app']['work_dir']
+            scan_cache = _load_scan_cache(work_dir)
+            now = int(time.time())
+            for e in entries:
+                if not e: continue
+                vid = e.get('id')
+                if not vid: continue
+                all_formats = []
+                for f in e.get('formats', []):
+                    if f.get('acodec') == 'none' and f.get('vcodec') == 'none': continue
+                    all_formats.append({
+                        'format_id': f.get('format_id'),
+                        'ext': f.get('ext'),
+                        'resolution': f.get('resolution') or (f"{f.get('width')}x{f.get('height')}" if f.get('width') else 'audio only'),
+                        'filesize': f.get('filesize') or f.get('filesize_approx') or 0,
+                        'vcodec': f.get('vcodec', 'none'),
+                        'acodec': f.get('acodec', 'none'),
+                        'abr': f.get('abr', 0),
+                        'vbr': f.get('vbr', 0),
+                        'note': f.get('format_note', ''),
+                        'is_thumbnail': f.get('ext') in ['webp', 'jpg', 'jpeg', 'png'],
+                    })
+                all_formats.sort(key=lambda x: (x['vcodec'] != 'none' and x['acodec'] != 'none', x['resolution']), reverse=True)
 
-        cfg['youtube']['sources'].append({
-            'url': url,
-            'title': title,
-            'type': 'channel' if '/channel/' in url or '/c/' in url or '/@' in url else 'video'
-        })
-        save_config(cfg)
-    return jsonify({'ok': True})
+                def res_height(f):
+                    try: return int(f['resolution'].split('x')[1])
+                    except: return 0
+
+                mp4_1080_video = [f for f in all_formats if f['ext'] == 'mp4' and f['acodec'] == 'none' and f['resolution'] == '1920x1080']
+                m4a_audio = [f for f in all_formats if f['ext'] == 'm4a' and f['vcodec'] == 'none']
+                best_video = sorted(mp4_1080_video, key=lambda f: f['filesize'], reverse=True)[0] if mp4_1080_video else None
+                best_audio = sorted(m4a_audio, key=lambda f: f['filesize'], reverse=True)[0] if m4a_audio else None
+                if not best_video:
+                    mp4_video_1080 = [f for f in all_formats if f['ext'] == 'mp4' and f['acodec'] == 'none' and f['resolution'] not in ('', 'audio only') and res_height(f) <= 1080]
+                    best_video = sorted(mp4_video_1080, key=lambda f: f['filesize'], reverse=True)[0] if mp4_video_1080 else None
+                if not best_audio:
+                    audio_only = [f for f in all_formats if f['vcodec'] == 'none' and f['acodec'] != 'none']
+                    best_audio = sorted(audio_only, key=lambda f: f['filesize'], reverse=True)[0] if audio_only else None
+                combo_1080 = [f for f in all_formats if f['acodec'] != 'none' and f['vcodec'] != 'none' and res_height(f) <= 1080]
+                best_combo = sorted(combo_1080, key=lambda f: f['filesize'], reverse=True)[0] if combo_1080 else None
+                use_combo = best_combo and not (best_video and best_audio)
+                recommended_ids = set()
+                if use_combo:
+                    recommended_ids.add(best_combo['format_id'])
+                else:
+                    if best_video: recommended_ids.add(best_video['format_id'])
+                    if best_audio: recommended_ids.add(best_audio['format_id'])
+                for f in all_formats:
+                    f['recommended'] = f['format_id'] in recommended_ids
+                if use_combo:
+                    rec_format_id = best_combo['format_id']
+                elif best_video and best_audio:
+                    rec_format_id = f"{best_video['format_id']}+{best_audio['format_id']}"
+                elif best_video:
+                    rec_format_id = best_video['format_id']
+                else:
+                    rec_format_id = None
+
+                scan_cache[vid] = {
+                    'title': e.get('title', ''),
+                    'description': e.get('description', ''),
+                    'formats': all_formats,
+                    'rec_format_id': rec_format_id,
+                    'cached_at': now,
+                    'channel_name': e.get('uploader') or e.get('channel', ''),
+                    'channel_id': e.get('channel_id') or e.get('uploader_id', ''),
+                }
+                new_candidates.append({
+                    'id': vid,
+                    'title': e.get('title', ''),
+                    'description': e.get('description', ''),
+                    'url': f"https://www.youtube.com/watch?v={vid}" if 'entries' in info else url,
+                    'url_type': 'video',
+                    'already_downloaded': False,
+                    'formats': all_formats,
+                    'rec_format_id': rec_format_id,
+                    'channel_name': e.get('uploader') or e.get('channel', ''),
+                    'channel_id': e.get('channel_id') or e.get('uploader_id', ''),
+                })
+            _save_scan_cache(work_dir, scan_cache)
+
+            # Mark already-uploaded videos and write video_meta for new ones
+            history = get_history()
+            um = _load_video_meta(work_dir)
+            skipped_ids = set()
+            for c in new_candidates:
+                vid = c['id']
+                already_uploaded = (
+                    vid in history or
+                    um.get(vid, {}).get('uploaded') or
+                    um.get(vid, {}).get('stages', {}).get('upload', {}).get('status') == 'done'
+                )
+                if already_uploaded:
+                    c['already_uploaded'] = True
+                    skipped_ids.add(vid)
+                else:
+                    # Write video_meta entry if not already present
+                    if vid not in um:
+                        um[vid] = {
+                            'title': c.get('title', ''),
+                            'original_title': c.get('title', ''),
+                            'tid': cfg['bilibili'].get('tid', 122),
+                            'tags': list(cfg['bilibili'].get('default_tags', [])),
+                            'copyright': 1,
+                            'source': c['url'],
+                            'schedule_time': None,
+                            'uploaded': False,
+                            'local_path': None,
+                            'original_thumbnail': None,
+                            'url': c['url'],
+                            'queued_at': int(time.time()),
+                            'stages': {
+                                'scan':      {'status': 'done',    'at': int(time.time())},
+                                'download':  {'status': 'pending', 'at': None},
+                                'transcode': {'status': 'pending', 'at': None},
+                                'translate': {'status': 'pending', 'at': None},
+                                'upload':    {'status': 'pending', 'at': None},
+                            },
+                        }
+            _save_video_meta(work_dir, um)
+
+            # Filter out already-uploaded from candidates to add
+            new_candidates_to_add = [c for c in new_candidates if c['id'] not in skipped_ids]
+    except Exception as ex:
+        logger.warning(f"add_source full scan failed, title-only fallback: {ex}")
+        skipped_ids = set()
+        new_candidates_to_add = new_candidates
+
+    skipped = len(skipped_ids)
+    all_skipped = skipped == len(new_candidates) and len(new_candidates) > 0
+
+    # Only save source URL if there are non-uploaded videos (or scan failed and we don't know)
+    if not all_skipped:
+        with _config_lock:
+            cfg = load_config()
+            if any(s['url'] == url for s in cfg['youtube']['sources']):
+                pass  # already exists, skip
+            else:
+                cfg['youtube']['sources'].append({
+                    'url': url,
+                    'title': title,
+                    'type': 'channel' if '/channel/' in url or '/c/' in url or '/@' in url else 'video'
+                })
+                save_config(cfg)
+    # Merge new (non-uploaded) candidates into S['candidates']
+    if new_candidates_to_add:
+        with state_lock:
+            existing_ids = {c['id'] for c in S['candidates']}
+            for c in new_candidates_to_add:
+                if c['id'] not in existing_ids:
+                    S['candidates'].append(c)
+            # Also sync video_meta in memory
+            cfg2 = load_config()
+            um2 = _load_video_meta(cfg2['app']['work_dir'])
+            for c in new_candidates_to_add:
+                vid = c['id']
+                if vid in um2 and vid not in S['video_meta']:
+                    S['video_meta'][vid] = um2[vid]
+            new_status = 'scan_done' if S['status'] == 'idle' else None
+        update_state(new_status)
+
+    return jsonify({'ok': True, 'candidates': len(new_candidates_to_add), 'skipped': skipped, 'all_skipped': all_skipped})
 
 @app.route('/api/sources/<int:idx>', methods=['DELETE'])
 def delete_source(idx):

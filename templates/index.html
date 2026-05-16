@@ -14,8 +14,8 @@
     <span>YT→哔哩</span>
   </div>
   <ul class="nav-links">
-    <li><a href="#" class="nav-link active" data-tab="pipeline">🚀 流水线</a></li>
-    <li><a href="#" class="nav-link" data-tab="sources">📋 来源管理</a></li>
+    <li><a href="#" class="nav-link active" data-tab="sources">📋 来源管理</a></li>
+    <li><a href="#" class="nav-link" data-tab="pipeline">🚀 流水线</a></li>
     <li><a href="#" class="nav-link" data-tab="history">🕐 历史记录</a></li>
     <li><a href="#" class="nav-link" data-tab="calendar">📅 投稿日历</a></li>
     <li><a href="#" class="nav-link" data-tab="settings">⚙️ 设置</a></li>
@@ -30,7 +30,7 @@
 <main class="main">
 
   <!-- ═══ Tab: Pipeline ═══ -->
-  <section class="tab-panel active" id="tab-pipeline">
+  <section class="tab-panel" id="tab-pipeline">
   <div class="pipeline-scroll">
     <div class="page-header">
       <h1>搬运流水线</h1>
@@ -74,29 +74,37 @@
       </div>
       <div class="video-list" id="video-list"></div>
     </div>
+
+    <!-- Schedule calendar (pending uploads) -->
+    <div id="sched-cal-section" style="display:none">
+      <div class="section-header">
+        <span>排班日历</span>
+        <div style="display:flex;gap:6px;align-items:center">
+          <button class="btn btn-ghost btn-sm" id="sched-cal-prev">‹</button>
+          <span id="sched-cal-label" style="font-size:13px;color:var(--text2)"></span>
+          <button class="btn btn-ghost btn-sm" id="sched-cal-next">›</button>
+          <button class="btn btn-ghost btn-sm" id="sched-cal-today">本周</button>
+        </div>
+      </div>
+      <div class="sched-cal-grid" id="sched-cal-grid"></div>
+    </div>
   </div><!-- /.pipeline-scroll -->
 
-    <!-- Log panel -->
-    <div class="log-section">
-      <div class="log-header">
-        <span>实时日志</span>
-        <button class="btn-tiny" id="btn-clear-log">清空</button>
-      </div>
-      <div class="log-body" id="log-body"></div>
-    </div>
   </section>
 
   <!-- ═══ Tab: Sources ═══ -->
-  <section class="tab-panel" id="tab-sources">
+  <section class="tab-panel active" id="tab-sources">
     <div class="page-header">
       <h1>来源管理</h1>
     </div>
 
     <div class="add-source-form">
-      <input type="text" id="new-source-url" class="url-input"
-        placeholder="粘贴 YouTube 频道 / 视频 / 播放列表 URL">
-      <button class="btn btn-primary" id="btn-add-source">+ 添加</button>
-      <button class="btn btn-warning" id="btn-clear-sources">清除全部</button>
+      <textarea id="new-source-url" class="url-input"
+        placeholder="粘贴 YouTube URL，每行一个（支持频道 / 视频 / 播放列表）" rows="3"></textarea>
+      <div class="add-source-btns">
+        <button class="btn btn-primary" id="btn-add-source">➕ 添加</button>
+        <button class="btn btn-warning" id="btn-clear-sources">清除全部</button>
+      </div>
     </div>
 
     <div class="source-list" id="source-list">
@@ -320,11 +328,19 @@
   <section class="tab-panel" id="tab-calendar">
     <div class="page-header">
       <h1>投稿日历</h1>
-      <div class="cal-nav" id="cal-nav">
-        <button class="btn btn-ghost btn-sm" id="cal-prev">‹</button>
-        <span class="cal-week-label" id="cal-week-label"></span>
-        <button class="btn btn-ghost btn-sm" id="cal-next">›</button>
-        <button class="btn btn-ghost btn-sm" id="cal-today">本周</button>
+      <div style="display:flex;gap:8px;align-items:center">
+        <button class="btn btn-ghost btn-sm" onclick="
+          document.querySelectorAll('.nav-link').forEach(l=>l.classList.remove('active'));
+          document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+          document.querySelector('.nav-link[data-tab=\'pipeline\']').classList.add('active');
+          document.getElementById('tab-pipeline').classList.add('active');
+        ">← 排班管理</button>
+        <div class="cal-nav" id="cal-nav">
+          <button class="btn btn-ghost btn-sm" id="cal-prev">‹</button>
+          <span class="cal-week-label" id="cal-week-label"></span>
+          <button class="btn btn-ghost btn-sm" id="cal-next">›</button>
+          <button class="btn btn-ghost btn-sm" id="cal-today">本周</button>
+        </div>
       </div>
     </div>
     <div class="cal-scroll">
