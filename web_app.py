@@ -5,6 +5,7 @@ import json
 import logging
 import subprocess
 import threading
+from queue import Queue
 import time
 from datetime import datetime
 from flask import Flask, render_template, request, jsonify, Response
@@ -17,6 +18,17 @@ def slugify(text):
     text = re.sub(r'[\\/:*?"<>|]', '_', text)
     # Remove trailing dots/spaces and limit length
     return text.strip().rstrip('. ')[:100]
+
+def _truncate_at_sentence(text, limit):
+    """在不超过 limit 字符的前提下，按句子边界截断文本。"""
+    if len(text) <= limit:
+        return text
+    chunk = text[:limit]
+    for sep in ['\n\n', '。', '！', '？', '\n', '.', '!', '?', '…']:
+        idx = chunk.rfind(sep)
+        if idx > limit // 3:
+            return chunk[:idx + len(sep)]
+    return chunk
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 os.makedirs('logs', exist_ok=True)
@@ -45,7 +57,15 @@ S = {
     'progress': {},         # id -> {pct, message} - for real-time reporting
     'video_meta': {},       # vid -> {title, tid, tags, schedule_time, copyright, source}
     'cancel_flag': False,
-    'current_task': None
+    'current_task': None,
+    'pipeline_active': False,
+    'pipeline_auto_upload': False,
+    'pipeline_counts': {
+        'download':  {'queued': 0, 'done': 0, 'failed': 0},
+        'transcode': {'queued': 0, 'done': 0, 'failed': 0},
+        'translate': {'queued': 0, 'done': 0, 'failed': 0},
+        'upload':    {'queued': 0, 'done': 0, 'failed': 0},
+    },
 }
 
 def reset_pipeline():
@@ -60,6 +80,14 @@ def reset_pipeline():
         S['video_meta'] = {}
         S['cancel_flag'] = False
         S['current_task'] = None
+        S['pipeline_active'] = False
+        S['pipeline_auto_upload'] = False
+        S['pipeline_counts'] = {
+            'download':  {'queued': 0, 'done': 0, 'failed': 0},
+            'transcode': {'queued': 0, 'done': 0, 'failed': 0},
+            'translate': {'queued': 0, 'done': 0, 'failed': 0},
+            'upload':    {'queued': 0, 'done': 0, 'failed': 0},
+        }
 
 # ── Config Loader ────────────────────────────────────────────────────────────
 CONFIG_FILE = 'config.yaml'
@@ -260,6 +288,8 @@ def restore_state():
     if not meta:
         return
 
+    scan_cache = _load_scan_cache(work_dir)
+
     restored = []
     dirty = False
     for vid, m in list(meta.items()):
@@ -278,7 +308,7 @@ def restore_state():
             'id': vid,
             'title': m.get('original_title') or m.get('title', ''),
             'translated_title': m.get('title', ''),
-            'description': '',
+            'description': scan_cache.get(vid, {}).get('description', ''),
             'url': m.get('url', f'https://www.youtube.com/watch?v={vid}'),
             'url_type': 'video',
             'already_downloaded': True,
@@ -296,7 +326,7 @@ def restore_state():
         with state_lock:
             S['transcoded'] = restored
             S['downloaded'] = list(restored)
-            S['status'] = 'transcode_done'
+            S['status'] = 'pipeline_done'
             S['video_meta'] = {
                 vid: m for vid, m in meta.items() if not m.get('uploaded')
             }
@@ -597,168 +627,177 @@ def _ensure_audio(video_path, vid_dir, vid, candidate, cfg):
     return video_path
 
 
-def run_download(video_ids, auto_transcode=False, with_subtitles=True):
+def _download_one(vid_entry, cfg):
+    """Download one video. Returns updated candidate dict on success, None on failure.
+    Appends to S['downloaded'] on success."""
+    from yt_dlp import YoutubeDL
+
+    work_dir = cfg['app']['work_dir']
+    vid = vid_entry['id']
+    format_id = vid_entry.get('format_id')
+    quality = vid_entry.get('quality', '1080p')
+    with_subtitles = vid_entry.get('with_subtitles', True)
+
+    c = next((x for x in S['candidates'] if x['id'] == vid), None)
+    if not c:
+        return None
+
+    # Carry per-video flags through the pipeline
+    c['auto_upload'] = vid_entry.get('auto_upload', False)
+
+    log_to_web('info', f"开始下载 [{format_id or quality}]: {c['title']}", vid)
+
+    safe_title = slugify(c['title'])
+    vid_dir = os.path.join(work_dir, f"{safe_title}_{vid[:8]}")
+    os.makedirs(vid_dir, exist_ok=True)
+    out_tmpl = os.path.join(vid_dir, f"{safe_title}.%(ext)s")
+
+    if format_id:
+        format_sel = format_id
+    elif quality == '4k':
+        format_sel = 'bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+    else:
+        format_sel = 'bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+
+    def ydl_hook(d):
+        if S['cancel_flag']:
+            raise Exception("Download cancelled by user")
+        if d['status'] == 'downloading':
+            p = d.get('_percent_str', '0%').replace('%', '').strip()
+            try:
+                p = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', p)
+                pct = float(p)
+            except:
+                pct = 0
+            speed_raw = d.get('_speed_str') or ''
+            speed_str = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', speed_raw).strip()
+            report_progress(vid, pct, f"下载中... {speed_str}")
+        elif d['status'] == 'finished':
+            if not c.get('description'):
+                desc = d.get('info_dict', {}).get('description', '')
+                if desc:
+                    c['description'] = desc
+            report_progress(vid, 100, "下载完成")
+
+    ydl_opts = {
+        'format': format_sel,
+        'outtmpl': out_tmpl,
+        'progress_hooks': [ydl_hook],
+        'proxy': cfg['app'].get('proxy'),
+        'quiet': True,
+        'no_warnings': True,
+        'ignoreerrors': True,
+        'cookiefile': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'youtube_cookies.txt'),
+        'merge_output_format': 'mp4',
+        'writethumbnail': True,
+        'convert_thumbnails': 'jpg',
+        'ffmpeg_location': cfg['ffmpeg'].get('bin_path'),
+        'js_runtimes': _js_runtimes(),
+    }
+    if with_subtitles:
+        ydl_opts.update({
+            'writesubtitles': True,
+            'writeautomaticsub': True,
+            'subtitleslangs': ['zh-Hans'],
+            'subtitlesformat': 'vtt',
+        })
+
     try:
-        update_state('downloading')
-        cfg = load_config()
-        work_dir = cfg['app']['work_dir']
-        
-        from yt_dlp import YoutubeDL
-        
-        for vid_entry in video_ids:
-            if S['cancel_flag']: break
-            vid = vid_entry['id']
-            # Accept explicit format_id from frontend selection
-            format_id = vid_entry.get('format_id')
-            quality = vid_entry.get('quality', '1080p')
-            
-            c = next((x for x in S['candidates'] if x['id'] == vid), None)
-            if not c: continue
-            
-            log_to_web('info', f"开始下载 [{format_id or quality}]: {c['title']}", vid)
-            
-            # Phase 1: Slugified Path Naming (include video_id to prevent collisions)
-            safe_title = slugify(c['title'])
-            vid_dir = os.path.join(work_dir, f"{safe_title}_{vid[:8]}")
-            os.makedirs(vid_dir, exist_ok=True)
-            out_tmpl = os.path.join(vid_dir, f"{safe_title}.%(ext)s")
-            
-            # Phase 2: Format selection
-            if format_id:
-                format_sel = format_id
-            elif quality == '4k':
-                format_sel = 'bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best'
+        try:
+            with YoutubeDL(ydl_opts) as ydl:
+                ydl.download([c['url']])
+        except Exception as ydl_err:
+            err_str = str(ydl_err)
+            if 'subtitle' in err_str.lower():
+                log_to_web('warning', f"字幕下载失败（已跳过）: {err_str}", vid)
             else:
-                format_sel = 'bestvideo[height<=1080]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]'
+                raise
 
-            def ydl_hook(d):
-                if S['cancel_flag']:
-                    raise Exception("Download cancelled by user")
-                if d['status'] == 'downloading':
-                    p = d.get('_percent_str', '0%').replace('%','').strip()
-                    try: 
-                        import re
-                        p = re.sub(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])', '', p)
-                        pct = float(p)
-                    except: pct = 0
-                    report_progress(vid, pct, f"下载中... {d.get('_speed_str','')}")
-                elif d['status'] == 'finished':
-                    report_progress(vid, 100, "下载完成")
+        found_video = None
+        expected = os.path.join(vid_dir, f"{safe_title}.mp4")
+        if os.path.exists(expected) and os.path.getsize(expected) > 0:
+            found_video = expected
+        else:
+            max_size = 0
+            if os.path.exists(vid_dir):
+                for f in os.listdir(vid_dir):
+                    if f.endswith(('.mp4', '.mkv', '.mov', '.ts', '.flv')):
+                        fpath = os.path.join(vid_dir, f)
+                        fsize = os.path.getsize(fpath)
+                        if fsize > max_size and fsize > 1 * 1024 * 1024:
+                            max_size = fsize
+                            found_video = fpath
 
-            ydl_opts = {
-                'format': format_sel,
-                'outtmpl': out_tmpl,
-                'progress_hooks': [ydl_hook],
-                'proxy': cfg['app'].get('proxy'),
-                'quiet': True,
-                'no_warnings': True,
-                'ignoreerrors': True,
-                'cookiefile': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'youtube_cookies.txt'),
-                'merge_output_format': 'mp4',
-                'writethumbnail': True,
-                'ffmpeg_location': cfg['ffmpeg'].get('bin_path'),
-                'js_runtimes': _js_runtimes(),
-            }
-            if with_subtitles:
-                ydl_opts.update({
+        if found_video:
+            c['local_path'] = found_video
+            c['local_dir'] = vid_dir
+            found_video = _ensure_audio(found_video, vid_dir, vid, c, cfg)
+            c['local_path'] = found_video
+
+            for f in os.listdir(vid_dir):
+                if f.lower().endswith(('.jpg', '.png', '.webp', '.jpeg')) and 'original_thumbnail' not in c:
+                    c['original_thumbnail'] = os.path.join(vid_dir, f)
+                elif f.endswith('.zh-Hans.vtt') or f.endswith('.zh-Hans.ass'):
+                    c['subtitle_zh'] = os.path.join(vid_dir, f)
+
+            if with_subtitles and not c.get('subtitle_zh'):
+                log_to_web('info', f"字幕未找到，尝试单独补下...", vid)
+                sub_opts = {
+                    'skip_download': True,
+                    'outtmpl': out_tmpl,
+                    'proxy': cfg['app'].get('proxy'),
+                    'quiet': True,
+                    'no_warnings': True,
+                    'cookiefile': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'youtube_cookies.txt'),
                     'writesubtitles': True,
                     'writeautomaticsub': True,
                     'subtitleslangs': ['zh-Hans'],
                     'subtitlesformat': 'vtt',
-                })
-
-            try:
+                    'ffmpeg_location': cfg['ffmpeg'].get('bin_path'),
+                    'js_runtimes': _js_runtimes(),
+                }
                 try:
-                    with YoutubeDL(ydl_opts) as ydl:
+                    with YoutubeDL(sub_opts) as ydl:
                         ydl.download([c['url']])
-                except Exception as ydl_err:
-                    err_str = str(ydl_err)
-                    # Subtitle-only errors (429, unavailable) — video may still be downloaded OK
-                    if 'subtitle' in err_str.lower():
-                        log_to_web('warning', f"字幕下载失败（已跳过）: {err_str}", vid)
-                    else:
-                        raise  # Re-raise real download errors
-
-                # Phase 3: Flexible Verify and Map
-                # First try the expected filename, then fall back to largest video file
-                found_video = None
-                expected = os.path.join(vid_dir, f"{safe_title}.mp4")
-                if os.path.exists(expected) and os.path.getsize(expected) > 0:
-                    found_video = expected
-                else:
-                    max_size = 0
-                    if os.path.exists(vid_dir):
-                        for f in os.listdir(vid_dir):
-                            if f.endswith(('.mp4', '.mkv', '.mov', '.ts', '.flv')):
-                                fpath = os.path.join(vid_dir, f)
-                                fsize = os.path.getsize(fpath)
-                                if fsize > max_size and fsize > 1 * 1024 * 1024: # Must be > 1MB
-                                    max_size = fsize
-                                    found_video = fpath
-
-                if found_video:
-                    # Store the local path for downstream steps
-                    c['local_path'] = found_video
-                    c['local_dir'] = vid_dir
-
-                    # Phase 3b: Verify audio track exists; merge if missing
-                    found_video = _ensure_audio(found_video, vid_dir, vid, c, cfg)
-                    c['local_path'] = found_video
-
-                    # Check for thumbnail and subtitles
                     for f in os.listdir(vid_dir):
-                        if f.lower().endswith(('.jpg', '.png', '.webp', '.jpeg')) and 'original_thumbnail' not in c:
-                            c['original_thumbnail'] = os.path.join(vid_dir, f)
-                        elif f.endswith('.zh-Hans.vtt') or f.endswith('.zh-Hans.ass'):
+                        if f.endswith('.zh-Hans.vtt') or f.endswith('.zh-Hans.ass'):
                             c['subtitle_zh'] = os.path.join(vid_dir, f)
+                            log_to_web('info', f"补下字幕成功: {f}", vid)
+                            break
+                except Exception as sub_err:
+                    log_to_web('warning', f"字幕补下失败（跳过）: {sub_err}", vid)
 
-                    # If subtitle missing (e.g. was 429'd during main download), retry subtitle-only
-                    if with_subtitles and not c.get('subtitle_zh'):
-                        log_to_web('info', f"字幕未找到，尝试单独补下...", vid)
-                        sub_opts = {
-                            'skip_download': True,
-                            'outtmpl': out_tmpl,
-                            'proxy': cfg['app'].get('proxy'),
-                            'quiet': True,
-                            'no_warnings': True,
-                            'cookiefile': os.path.join(os.path.dirname(os.path.abspath(__file__)), 'youtube_cookies.txt'),
-                            'writesubtitles': True,
-                            'writeautomaticsub': True,
-                            'subtitleslangs': ['zh-Hans'],
-                            'subtitlesformat': 'vtt',
-                            'ffmpeg_location': cfg['ffmpeg'].get('bin_path'),
-                            'js_runtimes': _js_runtimes(),
-                        }
-                        try:
-                            with YoutubeDL(sub_opts) as ydl:
-                                ydl.download([c['url']])
-                            # Re-scan for subtitle after retry
-                            for f in os.listdir(vid_dir):
-                                if f.endswith('.zh-Hans.vtt') or f.endswith('.zh-Hans.ass'):
-                                    c['subtitle_zh'] = os.path.join(vid_dir, f)
-                                    log_to_web('info', f"补下字幕成功: {f}", vid)
-                                    break
-                        except Exception as sub_err:
-                            log_to_web('warning', f"字幕补下失败（跳过）: {sub_err}", vid)
+            with state_lock:
+                S['downloaded'].append(c)
+            log_to_web('info', f"成功下载并识别: {os.path.basename(found_video)}", vid)
+            return c
+        else:
+            raise Exception("下载完成但未找到有效的视频文件(>1MB)")
 
-                    with state_lock:
-                        S['downloaded'].append(c)
-                    log_to_web('info', f"成功下载并识别: {os.path.basename(found_video)}", vid)
-                else:
-                    raise Exception("下载完成但未找到有效的视频文件(>1MB)")
+    except Exception as e:
+        err_str = str(e)
+        if 'Sign in to confirm your age' in err_str or 'age-restricted' in err_str.lower():
+            log_to_web('warning', f"⚠ 年龄限制视频，跳过下载: {vid}", vid)
+            with state_lock:
+                S['errors'].append({'id': vid, 'step': 'download', 'message': '年龄限制视频，无法下载'})
+        else:
+            log_to_web('error', f"下载阶段异常: {err_str}", vid)
+            with state_lock:
+                S['errors'].append({'id': vid, 'step': 'download', 'message': err_str})
+            log_to_web('error', f"下载失败: {err_str}", vid)
+        return None
 
-            except Exception as e:
-                # Log error but DO NOT DELETE the directory
-                err_str = str(e)
-                if 'Sign in to confirm your age' in err_str or 'age-restricted' in err_str.lower():
-                    log_to_web('warning', f"⚠ 年龄限制视频，跳过下载: {vid}", vid)
-                    with state_lock:
-                        S['errors'].append({'id': vid, 'step': 'download', 'message': '年龄限制视频，无法下载'})
-                else:
-                    log_to_web('error', f"下载阶段异常: {err_str}", vid)
-                    with state_lock:
-                        S['errors'].append({'id': vid, 'step': 'download', 'message': err_str})
-                    log_to_web('error', f"下载失败: {err_str}", vid)
+
+def run_download(video_ids, auto_transcode=False, with_subtitles=True):
+    try:
+        update_state('downloading')
+        cfg = load_config()
+
+        for vid_entry in video_ids:
+            if S['cancel_flag']: break
+            entry = dict(vid_entry)
+            entry['with_subtitles'] = with_subtitles
+            _download_one(entry, cfg)
 
         update_state('download_done')
         if auto_transcode and S['downloaded']:
@@ -767,6 +806,54 @@ def run_download(video_ids, auto_transcode=False, with_subtitles=True):
     except Exception as e:
         log_to_web('error', f"下载阶段崩溃: {str(e)}")
         update_state('scan_done')
+
+def _transcode_one(c, processor, cfg):
+    """Transcode one video. Returns True on success, False on failure."""
+    vid = c['id']
+    log_to_web('info', f"启动转码流程: {c['title']}", vid)
+
+    safe_title = slugify(c['title'])
+    vid_dir_name = f"{safe_title}_{vid[:8]}"
+    video_data = {
+        'id': vid,
+        'filepath': c.get('local_path') or os.path.join(cfg['app']['work_dir'], vid_dir_name, f"{safe_title}.mp4"),
+        'subtitle_zh': c.get('subtitle_zh', ''),
+    }
+
+    def transcode_progress(pct):
+        report_progress(vid, pct, "转码中 (视频流处理)...")
+
+    try:
+        def check_cancel(): return S['cancel_flag']
+        res = processor.process(video_data, cancel_check=check_cancel, progress_cb=transcode_progress)
+
+        if res:
+            expected_final = os.path.join(
+                cfg['app']['work_dir'], vid_dir_name, f"{safe_title}_final.mp4"
+            )
+            if res != expected_final and os.path.isfile(res):
+                os.replace(res, expected_final)
+                res = expected_final
+
+            if not os.path.isfile(res) or os.path.getsize(res) < 1024 * 1024:
+                raise Exception(f"转码输出文件缺失或过小: {res}")
+            with state_lock:
+                if not any(x['id'] == c['id'] for x in S['transcoded']):
+                    S['transcoded'].append(c)
+            _queue_for_upload(c)
+            _update_stage(cfg['app']['work_dir'], vid, 'transcode', 'done')
+            report_progress(vid, 100, "转码完成")
+            log_to_web('info', f"转码成功: {c['title']}", vid)
+            return True
+        else:
+            raise Exception("计算后端返回失败")
+    except Exception as e:
+        with state_lock:
+            S['errors'].append({'id': vid, 'step': 'transcode', 'message': str(e)})
+        _update_stage(cfg['app']['work_dir'], vid, 'transcode', 'failed')
+        log_to_web('error', f"转码失败: {str(e)}", vid)
+        return False
+
 
 def run_transcode():
     try:
@@ -777,59 +864,75 @@ def run_transcode():
 
         for c in S['downloaded']:
             if S['cancel_flag']: break
-            vid = c['id']
-            log_to_web('info', f"启动转码流程: {c['title']}", vid)
-
-            # Use Slugified Paths
-            safe_title = slugify(c['title'])
-            vid_dir_name = f"{safe_title}_{vid[:8]}"
-            video_data = {
-                'id': vid,
-                'filepath': c.get('local_path') or os.path.join(cfg['app']['work_dir'], vid_dir_name, f"{safe_title}.mp4"),
-                'subtitle_zh': c.get('subtitle_zh', ''),
-            }
-
-            def transcode_progress(pct):
-                report_progress(vid, pct, "转码中 (视频流处理)...")
-
-            try:
-                def check_cancel(): return S['cancel_flag']
-                res = processor.process(video_data, cancel_check=check_cancel, progress_cb=transcode_progress)
-
-                if res:
-                    # Normalize output filename to {safe_title}_final.mp4.
-                    # video_processor derives its output name from the input filepath,
-                    # which may include yt-dlp format codes (e.g. .f401), producing
-                    # a mismatch with the {safe_title}_final.mp4 that upload code expects.
-                    expected_final = os.path.join(
-                        cfg['app']['work_dir'], vid_dir_name, f"{safe_title}_final.mp4"
-                    )
-                    if res != expected_final and os.path.isfile(res):
-                        os.replace(res, expected_final)
-                        res = expected_final
-
-                    # Secondary validation: ensure _final.mp4 is playable
-                    if not os.path.isfile(res) or os.path.getsize(res) < 1024 * 1024:
-                        raise Exception(f"转码输出文件缺失或过小: {res}")
-                    with state_lock:
-                        if not any(x['id'] == c['id'] for x in S['transcoded']):
-                            S['transcoded'].append(c)
-                    _queue_for_upload(c)
-                    _update_stage(cfg['app']['work_dir'], vid, 'transcode', 'done')
-                    report_progress(vid, 100, "转码完成")
-                    log_to_web('info', f"转码成功: {c['title']}", vid)
-                else:
-                    raise Exception("计算后端返回失败")
-            except Exception as e:
-                with state_lock:
-                    S['errors'].append({'id': vid, 'step': 'transcode', 'message': str(e)})
-                _update_stage(cfg['app']['work_dir'], vid, 'transcode', 'failed')
-                log_to_web('error', f"转码失败: {str(e)}", vid)
+            _transcode_one(c, processor, cfg)
 
         update_state('transcode_done')
     except Exception as e:
         log_to_web('error', f"转码阶段崩溃: {str(e)}")
         update_state('download_done')
+
+def _translate_one(c, cfg, cover_proc, desc_prefix):
+    """Translate title and description for one video. Updates video_meta in place."""
+    vid = c['id']
+    work_dir = cfg['app']['work_dir']
+
+    log_to_web('info', f"翻译标题: {c['title']}", vid)
+    try:
+        translated = cover_proc.translate_title(c['title'])
+        if translated and translated != c['title']:
+            c['translated_title'] = translated
+            meta = _load_video_meta(work_dir)
+            if vid in meta:
+                meta[vid]['title'] = translated
+                _save_video_meta(work_dir, meta)
+                with state_lock:
+                    if vid in S['video_meta']:
+                        S['video_meta'][vid]['title'] = translated
+            log_to_web('info', f"翻译完成: {translated}", vid)
+        else:
+            log_to_web('warn', f"翻译结果为空或与原文相同，跳过", vid)
+    except Exception as e:
+        log_to_web('error', f"翻译失败: {e}", vid)
+
+    log_to_web('info', f"翻译简介...", vid)
+    try:
+        original_desc = c.get('description', '')
+        source_url = c.get('url', '')
+        if original_desc:
+            try:
+                translated_desc = cover_proc.translate_description(original_desc)
+            except Exception as e:
+                log_to_web('warn', f"简介翻译失败，使用原文: {e}", vid)
+                translated_desc = original_desc
+            final_desc = f"{translated_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
+            final_desc = _truncate_at_sentence(final_desc, 2000)
+            meta = _load_video_meta(work_dir)
+            if vid in meta:
+                meta[vid]['desc'] = final_desc
+                _save_video_meta(work_dir, meta)
+            with state_lock:
+                if vid in S['video_meta']:
+                    S['video_meta'][vid]['desc'] = final_desc
+            log_to_web('info', f"简介处理完成 ({len(final_desc)} 字)", vid)
+        else:
+            # 无原始描述（重启后还原的视频）——只在没有已存简介时才设置默认前缀，不覆盖用户已有内容
+            meta = _load_video_meta(work_dir)
+            if vid in meta and not meta[vid].get('desc'):
+                final_desc = desc_prefix.replace('{youtube_url}', source_url)
+                final_desc = _truncate_at_sentence(final_desc, 2000)
+                if final_desc:
+                    meta[vid]['desc'] = final_desc
+                    _save_video_meta(work_dir, meta)
+                    with state_lock:
+                        if vid in S['video_meta']:
+                            S['video_meta'][vid]['desc'] = final_desc
+            else:
+                log_to_web('info', f"无原始简介，跳过简介翻译（保留已有内容）", vid)
+    except Exception as e:
+        log_to_web('error', f"简介处理失败: {e}", vid)
+
+    _update_stage(work_dir, vid, 'translate', 'done')
+
 
 def run_translate(vids=None):
     """翻译 S['transcoded'] 中的标题并写入 video_meta.json。
@@ -837,64 +940,16 @@ def run_translate(vids=None):
     try:
         update_state('translating')
         cfg = load_config()
-        work_dir = cfg['app']['work_dir']
         from cover_processor import CoverProcessor
         cover_proc = CoverProcessor(cfg)
+        desc_prefix = cfg['bilibili'].get('desc_prefix', '')
 
         targets = [c for c in S['transcoded'] if vids is None or c['id'] in vids]
-        desc_prefix = cfg['bilibili'].get('desc_prefix', '')
         for c in targets:
             if S['cancel_flag']: break
-            vid = c['id']
-            log_to_web('info', f"翻译标题: {c['title']}", vid)
-            try:
-                translated = cover_proc.translate_title(c['title'])
-                if translated and translated != c['title']:
-                    c['translated_title'] = translated
-                    meta = _load_video_meta(work_dir)
-                    if vid in meta:
-                        meta[vid]['title'] = translated
-                        _save_video_meta(work_dir, meta)
-                        with state_lock:
-                            if vid in S['video_meta']:
-                                S['video_meta'][vid]['title'] = translated
-                    log_to_web('info', f"翻译完成: {translated}", vid)
-                else:
-                    log_to_web('warn', f"翻译结果为空或与原文相同，跳过", vid)
-            except Exception as e:
-                log_to_web('error', f"翻译失败: {e}", vid)
-
-            # 翻译简介并截断至 Bilibili 2000 字上限
-            log_to_web('info', f"翻译简介...", vid)
-            try:
-                original_desc = c.get('description', '')
-                source_url = c.get('url', '')
-                if original_desc:
-                    try:
-                        translated_desc = cover_proc.translate_description(original_desc)
-                    except Exception as e:
-                        log_to_web('warn', f"简介翻译失败，使用原文: {e}", vid)
-                        translated_desc = original_desc
-                    final_desc = f"{translated_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
-                else:
-                    final_desc = desc_prefix.replace('{youtube_url}', source_url)
-                final_desc = final_desc[:2000]
-                meta = _load_video_meta(work_dir)
-                if vid in meta:
-                    meta[vid]['desc'] = final_desc
-                    _save_video_meta(work_dir, meta)
-                with state_lock:
-                    if vid in S['video_meta']:
-                        S['video_meta'][vid]['desc'] = final_desc
-                log_to_web('info', f"简介处理完成 ({len(final_desc)} 字)", vid)
-            except Exception as e:
-                log_to_web('error', f"简介处理失败: {e}", vid)
+            _translate_one(c, cfg, cover_proc, desc_prefix)
 
         update_state('translate_done')
-        # Mark translate stage done for all translated videos
-        cfg2 = load_config()
-        for c in targets:
-            _update_stage(cfg2['app']['work_dir'], c['id'], 'translate', 'done')
     except Exception as e:
         log_to_web('error', f"翻译阶段崩溃: {str(e)}")
         update_state('transcode_done')
@@ -954,7 +1009,8 @@ def _do_upload_single(vid, c, uploader, cfg):
         copyright_override=copyright_override,
         source_override=source_override,
         desc_override=desc_override,
-        cover_text=cover_text
+        cover_text=cover_text,
+        cancel_check=lambda: S['cancel_flag']
     )
     if res:
         with state_lock:
@@ -1006,6 +1062,166 @@ def run_upload():
         log_to_web('error', f"上传阶段崩溃: {str(e)}")
         update_state('transcode_done')
 
+# ── Pipeline Workers ──────────────────────────────────────────────────────────
+
+def _pipeline_worker_download(in_q, out_q):
+    cfg = load_config()
+    while True:
+        item = in_q.get()
+        if item is None:
+            out_q.put(None)
+            break
+        if S['cancel_flag']:
+            out_q.put(None)
+            break
+        c = _download_one(item, cfg)
+        with state_lock:
+            if c:
+                S['pipeline_counts']['download']['done'] += 1
+            else:
+                S['pipeline_counts']['download']['failed'] += 1
+        update_state()
+        if c:
+            out_q.put(c)
+
+
+def _pipeline_worker_transcode(in_q, out_q):
+    cfg = load_config()
+    from video_processor import VideoProcessor
+    processor = VideoProcessor(cfg)
+    while True:
+        item = in_q.get()
+        if item is None:
+            out_q.put(None)
+            break
+        if S['cancel_flag']:
+            out_q.put(None)
+            break
+        ok = _transcode_one(item, processor, cfg)
+        with state_lock:
+            if ok:
+                S['pipeline_counts']['transcode']['done'] += 1
+            else:
+                S['pipeline_counts']['transcode']['failed'] += 1
+        update_state()
+        if ok:
+            out_q.put(item)
+
+
+def _pipeline_worker_translate(in_q, out_q):
+    cfg = load_config()
+    from cover_processor import CoverProcessor
+    cover_proc = CoverProcessor(cfg)
+    desc_prefix = cfg['bilibili'].get('desc_prefix', '')
+    while True:
+        item = in_q.get()
+        if item is None:
+            out_q.put(None)
+            break
+        if S['cancel_flag']:
+            out_q.put(None)
+            break
+        _translate_one(item, cfg, cover_proc, desc_prefix)
+        with state_lock:
+            S['pipeline_counts']['translate']['done'] += 1
+        update_state()
+        if item.get('auto_upload', False):
+            out_q.put(item)
+
+
+def _pipeline_worker_upload(in_q):
+    cfg = load_config()
+    uploader = BilibiliUploader(cfg)
+    upload_interval = cfg['bilibili'].get('upload_interval', 30)
+    while True:
+        item = in_q.get()
+        if item is None:
+            break
+        if S['cancel_flag']:
+            break
+        vid = item['id']
+        log_to_web('info', f"准备上传至 B站: {item['title']}", vid)
+        try:
+            res = _do_upload_single(vid, item, uploader, cfg)
+            if res:
+                with state_lock:
+                    S['pipeline_counts']['upload']['done'] += 1
+                if upload_interval > 0 and not S['cancel_flag']:
+                    log_to_web('info', f"等待 {upload_interval} 秒后继续下一个上传...")
+                    time.sleep(upload_interval)
+            else:
+                with state_lock:
+                    S['pipeline_counts']['upload']['failed'] += 1
+                    S['errors'].append({'id': vid, 'step': 'upload', 'message': '上传器返回失败状态'})
+        except Exception as e:
+            with state_lock:
+                S['pipeline_counts']['upload']['failed'] += 1
+                S['errors'].append({'id': vid, 'step': 'upload', 'message': str(e)})
+            log_to_web('error', f"上传失败: {str(e)}", vid)
+        update_state()
+
+
+def _prevent_sleep():
+    import ctypes
+    ES_CONTINUOUS       = 0x80000000
+    ES_SYSTEM_REQUIRED  = 0x00000001
+    ES_DISPLAY_REQUIRED = 0x00000002
+    ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+    )
+
+def _allow_sleep():
+    import ctypes
+    ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS only
+
+
+def run_pipeline(video_ids):
+    _prevent_sleep()
+    try:
+        update_state('pipeline')
+        with state_lock:
+            S['pipeline_active'] = True
+            S['pipeline_auto_upload'] = any(v.get('auto_upload', False) for v in video_ids)
+            S['pipeline_counts'] = {
+                'download':  {'queued': len(video_ids), 'done': 0, 'failed': 0},
+                'transcode': {'queued': 0, 'done': 0, 'failed': 0},
+                'translate': {'queued': 0, 'done': 0, 'failed': 0},
+                'upload':    {'queued': 0, 'done': 0, 'failed': 0},
+            }
+
+        download_q = Queue()
+        transcode_q = Queue()
+        translate_q = Queue()
+        upload_q = Queue()
+
+        threads = [
+            threading.Thread(target=_pipeline_worker_download,  args=(download_q, transcode_q), daemon=True),
+            threading.Thread(target=_pipeline_worker_transcode, args=(transcode_q, translate_q), daemon=True),
+            threading.Thread(target=_pipeline_worker_translate, args=(translate_q, upload_q),   daemon=True),
+            threading.Thread(target=_pipeline_worker_upload,    args=(upload_q,),               daemon=True),
+        ]
+        for t in threads:
+            t.start()
+
+        for vid_entry in video_ids:
+            download_q.put(vid_entry)
+        download_q.put(None)
+
+        for t in threads:
+            t.join()
+
+        with state_lock:
+            S['pipeline_active'] = False
+        update_state('pipeline_done')
+        log_to_web('info', "流水线全部完成！")
+    except Exception as e:
+        with state_lock:
+            S['pipeline_active'] = False
+        log_to_web('error', f"流水线崩溃: {str(e)}")
+        update_state('scan_done')
+    finally:
+        _allow_sleep()
+
 # ── History Persistence ──────────────────────────────────────────────────────
 HISTORY_FILE = 'history.json'
 def get_history():
@@ -1052,7 +1268,7 @@ def get_status():
 @app.route('/api/scan', methods=['POST'])
 def trigger_scan():
     with state_lock:
-        if S['status'] in ['scanning', 'downloading', 'transcoding', 'uploading']:
+        if S['status'] in ['scanning', 'pipeline']:
             return jsonify({'error': 'Pipeline busy'}), 400
         S['cancel_flag'] = False
         S['current_task'] = threading.Thread(target=run_scan)
@@ -1261,7 +1477,7 @@ def rescan_upload_queue():
 @app.route('/api/translate', methods=['POST'])
 def trigger_translate():
     with state_lock:
-        if S['status'] not in ('transcode_done', 'translate_done'):
+        if S['status'] not in ('transcode_done', 'translate_done', 'pipeline_done'):
             return jsonify({'error': 'Wrong state'}), 400
         S['cancel_flag'] = False
         S['current_task'] = threading.Thread(target=run_translate)
@@ -1305,7 +1521,7 @@ def trigger_translate_single(vid):
 def trigger_upload():
     data = request.json or {}
     with state_lock:
-        if S['status'] not in ('transcode_done', 'translate_done'): return jsonify({'error': 'Wrong state'}), 400
+        if S['status'] not in ('transcode_done', 'translate_done', 'pipeline_done'): return jsonify({'error': 'Wrong state'}), 400
         S['video_meta'].update(data.get('meta', {}))
         S['cancel_flag'] = False
         S['current_task'] = threading.Thread(target=run_upload)
@@ -1336,6 +1552,60 @@ def trigger_upload_single(vid):
 
     threading.Thread(target=worker, daemon=True).start()
     return jsonify({'ok': True})
+
+@app.route('/api/pipeline/start', methods=['POST'])
+def trigger_pipeline():
+    data = request.json or {}
+    video_ids = data.get('video_ids', [])
+    if not video_ids:
+        return jsonify({'error': 'No video IDs provided'}), 400
+    with state_lock:
+        if S['status'] not in ('scan_done', 'pipeline_done'):
+            return jsonify({'error': 'Wrong state'}), 400
+        S['cancel_flag'] = False
+        S['current_task'] = threading.Thread(
+            target=run_pipeline, args=(video_ids,), daemon=True
+        )
+        S['current_task'].start()
+    return jsonify({'ok': True})
+
+
+@app.route('/api/prescan_meta/<vid>', methods=['POST'])
+def prescan_meta(vid):
+    """扫描阶段保存定时/元数据预设，下载开始前调用。"""
+    data = request.json or {}
+    cfg = load_config()
+    work_dir = cfg['app']['work_dir']
+    meta = _load_video_meta(work_dir)
+    if vid not in meta:
+        c = next((x for x in S['candidates'] if x['id'] == vid), {})
+        meta[vid] = {
+            'title': c.get('title', ''),
+            'original_title': c.get('title', ''),
+            'tid': cfg['bilibili'].get('tid', 122),
+            'tags': list(cfg['bilibili'].get('default_tags', [])),
+            'copyright': 1,
+            'source': c.get('url', ''),
+            'schedule_time': None,
+            'uploaded': False,
+            'local_path': None,
+            'url': c.get('url', ''),
+            'stages': {
+                'scan':      {'status': 'done',    'at': int(time.time())},
+                'download':  {'status': 'pending', 'at': None},
+                'transcode': {'status': 'pending', 'at': None},
+                'translate': {'status': 'pending', 'at': None},
+                'upload':    {'status': 'pending', 'at': None},
+            },
+        }
+    for key in ('schedule_time', 'tid', 'tags', 'copyright', 'cover_text'):
+        if key in data:
+            meta[vid][key] = data[key]
+    _save_video_meta(work_dir, meta)
+    with state_lock:
+        S['video_meta'][vid] = meta[vid]
+    return jsonify({'ok': True})
+
 
 @app.route('/api/reset', methods=['POST'])
 def trigger_reset():
@@ -1439,11 +1709,8 @@ def trigger_retry():
 # Maps each clickable step → the state BEFORE that step (so user can re-run it)
 # Clicking "translate" means "go back to before translate, let me run it again"
 _JUMP_TARGET = {
-    'scan':      'idle',
-    'download':  'scan_done',
-    'transcode': 'download_done',
-    'translate': 'transcode_done',
-    'upload':    'translate_done',
+    'scan':     'idle',
+    'pipeline': 'scan_done',
 }
 
 @app.route('/api/jump/<step>', methods=['POST'])
@@ -1540,6 +1807,14 @@ def delete_source(idx):
             save_config(cfg)
             return jsonify({'ok': True})
     return jsonify({'error': 'Invalid index'}), 400
+
+@app.route('/api/sources', methods=['DELETE'])
+def clear_sources():
+    with _config_lock:
+        cfg = load_config()
+        cfg['youtube']['sources'] = []
+        save_config(cfg)
+    return jsonify({'ok': True})
 
 # ── History API ──────────────────────────────────────────────────────────────
 @app.route('/api/history', methods=['GET'])

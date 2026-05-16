@@ -50,35 +50,11 @@
         </div>
       </div>
       <div class="step-arrow">›</div>
-      <div class="step" id="step-download">
+      <div class="step" id="step-pipeline">
         <div class="step-num">2</div>
         <div class="step-body">
-          <div class="step-title">下载</div>
-          <div class="step-desc">获取视频文件</div>
-        </div>
-      </div>
-      <div class="step-arrow">›</div>
-      <div class="step" id="step-transcode">
-        <div class="step-num">3</div>
-        <div class="step-body">
-          <div class="step-title">转码</div>
-          <div class="step-desc">添加片头</div>
-        </div>
-      </div>
-      <div class="step-arrow">›</div>
-      <div class="step" id="step-translate">
-        <div class="step-num">4</div>
-        <div class="step-body">
-          <div class="step-title">翻译</div>
-          <div class="step-desc">AI 标题翻译</div>
-        </div>
-      </div>
-      <div class="step-arrow">›</div>
-      <div class="step" id="step-upload">
-        <div class="step-num">5</div>
-        <div class="step-body">
-          <div class="step-title">上传</div>
-          <div class="step-desc">发布至B站</div>
+          <div class="step-title">流水线</div>
+          <div class="step-desc">下载→转码→翻译→上传</div>
         </div>
       </div>
     </div>
@@ -120,6 +96,7 @@
       <input type="text" id="new-source-url" class="url-input"
         placeholder="粘贴 YouTube 频道 / 视频 / 播放列表 URL">
       <button class="btn btn-primary" id="btn-add-source">+ 添加</button>
+      <button class="btn btn-warning" id="btn-clear-sources">清除全部</button>
     </div>
 
     <div class="source-list" id="source-list">

@@ -3,10 +3,23 @@ import re
 import json
 import logging
 import time
+import threading
+import ctypes
 from datetime import datetime
 from cover_processor import CoverProcessor
 
 logger = logging.getLogger(__name__)
+
+_PROXY_ENV_KEYS = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
+
+def _force_kill_thread(t):
+    """Raise SystemExit in a running thread via ctypes."""
+    if not t.is_alive():
+        return
+    ctypes.pythonapi.PyThreadState_SetAsyncExc(
+        ctypes.c_ulong(t.ident),
+        ctypes.py_object(SystemExit)
+    )
 
 class BilibiliUploader:
     def __init__(self, config):
@@ -14,7 +27,7 @@ class BilibiliUploader:
         self.cookie_file = 'cookies.json'
         self.cover_proc = CoverProcessor(config)
 
-    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None, desc_override=None, cover_text=None):
+    def upload(self, file_path, title, source_url, original_thumbnail=None, original_description=None, progress_callback=None, tid_override=None, tags_override=None, dtime_override=None, title_already_translated=False, copyright_override=None, source_override=None, desc_override=None, cover_text=None, cancel_check=None):
         """
         Uploads a video to Bilibili using biliup's internal Python API (no CLI).
         """
@@ -77,85 +90,111 @@ class BilibiliUploader:
 
         copyright_val = copyright_override if copyright_override in (1, 2) else 1
 
-        # Step 3: Upload via biliup Python API
+        # Step 3: Upload via biliup Python API (no proxy — biliup targets domestic Bilibili CDN)
         max_retries = 3
-        for attempt in range(max_retries):
-            logger.info(f"Starting Bilibili upload (Attempt {attempt+1}/{max_retries}): {bili_title}")
-            try:
-                from biliup.plugins.bili_webup import BiliBili, Data
+        _saved = {k: os.environ.pop(k, None) for k in _PROXY_ENV_KEYS}
+        try:
+            for attempt in range(max_retries):
+                logger.info(f"Starting Bilibili upload (Attempt {attempt+1}/{max_retries}): {bili_title}")
+                try:
+                    from biliup.plugins.bili_webup import BiliBili, Data
 
-                video = Data()
-                video.title = bili_title[:80]
-                video.tid = tid
-                video.desc = final_description
-                video.copyright = copyright_val
-                if copyright_val == 2:
-                    video.source = source_override or source_url
-                video.set_tag(tags)
-                if dtime_override:
-                    video.delay_time(dtime_override)
+                    video = Data()
+                    video.title = bili_title[:80]
+                    video.tid = tid
+                    video.desc = final_description
+                    video.copyright = copyright_val
+                    if copyright_val == 2:
+                        video.source = source_override or source_url
+                    video.set_tag(tags)
+                    if dtime_override:
+                        video.delay_time(dtime_override)
 
-                with BiliBili(video) as bili:
-                    # Load cookies
-                    with open(self.cookie_file, 'r', encoding='utf-8') as f:
-                        cookies_data = json.load(f)
-                    bili.login_by_cookies(cookies_data)
+                    with BiliBili(video) as bili:
+                        # Load cookies
+                        with open(self.cookie_file, 'r', encoding='utf-8') as f:
+                            cookies_data = json.load(f)
+                        bili.login_by_cookies(cookies_data)
 
-                    # Upload video file with progress reporting
-                    if progress_callback:
-                        progress_callback(5, "开始上传视频文件...")
-
-                    logger.info(f"Uploading video file: {file_path}")
-
-                    # Intercept biliup's chunk-level logger to report real-time progress
-                    _biliup_logger = logging.getLogger('biliup')
-                    class _ProgressHandler(logging.Handler):
-                        def emit(self, record):
-                            if progress_callback:
-                                msg = record.getMessage()
-                                m = re.search(r'=>\s*([\d.]+)%', msg)
-                                if m:
-                                    chunk_pct = float(m.group(1))
-                                    # Map 0-100% chunk progress to 5-83% overall
-                                    overall = 5 + chunk_pct * 0.78
-                                    progress_callback(int(overall), f"上传中 {chunk_pct:.1f}%")
-                    _ph = _ProgressHandler()
-                    _biliup_logger.addHandler(_ph)
-                    try:
-                        video_part = bili.upload_file(file_path, lines='AUTO', tasks=3)
-                    finally:
-                        _biliup_logger.removeHandler(_ph)
-                    video_part['title'] = video_part['title'][:80]
-                    video.append(video_part)
-
-                    if progress_callback:
-                        progress_callback(85, "视频上传完成，处理封面...")
-
-                    # Upload cover
-                    if cover_path and os.path.exists(cover_path):
-                        try:
-                            cover_url = bili.cover_up(cover_path).replace('http:', '')
-                            video.cover = cover_url
-                            logger.info(f"Cover uploaded: {cover_url}")
-                        except Exception as e:
-                            logger.warning(f"Cover upload failed (non-fatal): {e}")
-
-                    if progress_callback:
-                        progress_callback(95, "提交稿件...")
-
-                    # Submit
-                    ret = bili.submit('web')
-                    if ret.get('code') == 0:
-                        logger.info(f"Bilibili upload success: {bili_title}, aid={ret.get('data', {}).get('aid')}")
+                        # Upload video file with progress reporting
                         if progress_callback:
-                            progress_callback(100, "上传成功!")
-                        return True
-                    else:
-                        raise Exception(f"Submit failed: {ret}")
+                            progress_callback(5, "开始上传视频文件...")
 
-            except Exception as e:
-                logger.error(f"Upload attempt {attempt+1} failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(5)
+                        logger.info(f"Uploading video file: {file_path}")
+
+                        # Intercept biliup's chunk-level logger to report real-time progress
+                        _biliup_logger = logging.getLogger('biliup')
+                        class _ProgressHandler(logging.Handler):
+                            def emit(self, record):
+                                if progress_callback:
+                                    msg = record.getMessage()
+                                    m = re.search(r'=>\s*([\d.]+)%', msg)
+                                    if m:
+                                        chunk_pct = float(m.group(1))
+                                        # Map 0-100% chunk progress to 5-83% overall
+                                        overall = 5 + chunk_pct * 0.78
+                                        progress_callback(int(overall), f"上传中 {chunk_pct:.1f}%")
+                        _ph = _ProgressHandler()
+                        _biliup_logger.addHandler(_ph)
+                        try:
+                            # Run upload_file in a subthread so cancel_check can interrupt it
+                            _result = [None]
+                            _exc = [None]
+                            def _upload_worker():
+                                try:
+                                    _result[0] = bili.upload_file(file_path, lines='AUTO', tasks=3)
+                                except Exception as e:
+                                    _exc[0] = e
+                            _t = threading.Thread(target=_upload_worker, daemon=True)
+                            _t.start()
+                            while _t.is_alive():
+                                _t.join(timeout=1.0)
+                                if cancel_check and cancel_check():
+                                    _force_kill_thread(_t)
+                                    _t.join(timeout=3.0)
+                                    raise Exception("Upload cancelled by user")
+                            if _exc[0]:
+                                raise _exc[0]
+                            video_part = _result[0]
+                        finally:
+                            _biliup_logger.removeHandler(_ph)
+                        if video_part is None:
+                            raise Exception("upload_file returned None (CDN disconnect or API error)")
+                        video_part['title'] = video_part['title'][:80]
+                        video.append(video_part)
+
+                        if progress_callback:
+                            progress_callback(85, "视频上传完成，处理封面...")
+
+                        # Upload cover
+                        if cover_path and os.path.exists(cover_path):
+                            try:
+                                cover_url = bili.cover_up(cover_path).replace('http:', '')
+                                video.cover = cover_url
+                                logger.info(f"Cover uploaded: {cover_url}")
+                            except Exception as e:
+                                logger.warning(f"Cover upload failed (non-fatal): {e}")
+
+                        if progress_callback:
+                            progress_callback(95, "提交稿件...")
+
+                        # Submit
+                        ret = bili.submit('web')
+                        if ret.get('code') == 0:
+                            logger.info(f"Bilibili upload success: {bili_title}, aid={ret.get('data', {}).get('aid')}")
+                            if progress_callback:
+                                progress_callback(100, "上传成功!")
+                            return True
+                        else:
+                            raise Exception(f"Submit failed: {ret}")
+
+                except Exception as e:
+                    logger.error(f"Upload attempt {attempt+1} failed: {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(5)
+        finally:
+            for k, v in _saved.items():
+                if v is not None:
+                    os.environ[k] = v
 
         return False

@@ -251,6 +251,53 @@ class VideoProcessor:
 
         return srt_path
 
+    def _get_duration_ms(self, filepath):
+        """Return duration of a media file in milliseconds, 0 on failure."""
+        ffmpeg_dir = os.path.dirname(os.path.abspath(self.ffmpeg_path))
+        ffprobe_basename = re.sub(r'(?i)ffmpeg', 'ffprobe', os.path.basename(self.ffmpeg_path))
+        ffprobe_path = os.path.join(ffmpeg_dir, ffprobe_basename) if ffmpeg_dir else ffprobe_basename
+        try:
+            r = subprocess.run(
+                [ffprobe_path, '-v', 'error', '-show_entries', 'format=duration',
+                 '-of', 'csv=p=0', filepath],
+                capture_output=True, text=True, timeout=15
+            )
+            return int(float(r.stdout.strip()) * 1000)
+        except Exception:
+            return 0
+
+    def _shift_srt(self, srt_path, offset_ms):
+        """Return path to a copy of srt_path with all timestamps shifted by offset_ms."""
+        if offset_ms <= 0:
+            return srt_path
+        shifted_path = re.sub(r'\.srt$', '_shifted.srt', srt_path, flags=re.IGNORECASE)
+
+        def ts_to_ms(ts):
+            h, m, s_ms = ts.split(':')
+            s, ms = s_ms.split(',')
+            return int(h)*3600000 + int(m)*60000 + int(s)*1000 + int(ms)
+
+        def ms_to_ts(ms):
+            h = ms // 3600000; ms %= 3600000
+            m = ms // 60000;   ms %= 60000
+            s = ms // 1000;    ms %= 1000
+            return f"{h:02}:{m:02}:{s:02},{ms:03}"
+
+        def shift_line(match):
+            start = ts_to_ms(match.group(1)) + offset_ms
+            end   = ts_to_ms(match.group(2)) + offset_ms
+            return f"{ms_to_ts(start)} --> {ms_to_ts(end)}"
+
+        with open(srt_path, encoding='utf-8') as f:
+            content = f.read()
+        shifted = re.sub(
+            r'(\d{2}:\d{2}:\d{2},\d{3})\s+-->\s+(\d{2}:\d{2}:\d{2},\d{3})',
+            shift_line, content
+        )
+        with open(shifted_path, 'w', encoding='utf-8') as f:
+            f.write(shifted)
+        return shifted_path
+
     def _sub_filter(self, srt_path, margin_v, font_size, colour):
         """Build a subtitles= filter string with force_style for a given SRT file."""
         # ffmpeg subtitles filter: backslash→forward slash, then escape filter-graph specials
@@ -258,9 +305,9 @@ class VideoProcessor:
         # Escape characters special to ffmpeg's filter graph / subtitles filter
         for ch in (':', '(', ')', '[', ']', ',', ';', "'"):
             safe_path = safe_path.replace(ch, '\\' + ch)
-        style = (f"PlayResX=1920,PlayResY=1080,Alignment=2,MarginV={margin_v},"
-                 f"Fontname=SimSun,FontSize={font_size},PrimaryColour={colour},"
-                 f"OutlineColour=&H00000000&,BorderStyle=1,Outline=3,Shadow=1,"
+        style = (f"PlayResX=1920\\,PlayResY=1080\\,Alignment=2\\,MarginV={margin_v}\\,"
+                 f"Fontname=SimSun\\,FontSize={font_size}\\,PrimaryColour={colour}\\,"
+                 f"OutlineColour=&H00000000&\\,BorderStyle=1\\,Outline=3\\,Shadow=1\\,"
                  f"WrapStyle=1")
         return f"subtitles='{safe_path}':force_style='{style}'"
 
@@ -365,6 +412,11 @@ class VideoProcessor:
         filter_str = "[0:v]format=yuv420p,setsar=1[v0];[1:v]format=yuv420p,setsar=1[v1];[v0][0:a][v1][1:a]concat=n=2:v=1:a=1[outv][outa]"
 
         # Build subtitle burn-in chain (appended after concat)
+        # Subtitle SRT timestamps start at 0 (relative to the source video),
+        # but the concat output has the intro prepended — shift timestamps accordingly.
+        intro_offset_ms = self._get_duration_ms(matched_intro)
+        logging.info(f"Intro duration for subtitle offset: {intro_offset_ms}ms")
+
         sub_filters = []
         for vtt_key, margin_v, font_size, colour in [
             ('subtitle_zh', 60, 58, '&H00FFFFFF&'),   # 中文：白色，1080p标准字号
@@ -373,8 +425,10 @@ class VideoProcessor:
             if vtt_path and os.path.isfile(vtt_path):
                 srt_path = self._vtt_to_srt(vtt_path)
                 if srt_path and os.path.getsize(srt_path) > 0:
+                    if intro_offset_ms > 0:
+                        srt_path = self._shift_srt(srt_path, intro_offset_ms)
                     sub_filters.append(self._sub_filter(srt_path, margin_v, font_size, colour))
-                    logging.info(f"Subtitle burn-in: {vtt_key} -> {srt_path}")
+                    logging.info(f"Subtitle burn-in (+{intro_offset_ms}ms offset): {vtt_key} -> {srt_path}")
                 else:
                     logging.info(f"Subtitle skipped (empty SRT): {vtt_key}")
 

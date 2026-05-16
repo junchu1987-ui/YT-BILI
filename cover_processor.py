@@ -4,15 +4,31 @@ from PIL import Image, ImageDraw, ImageFont
 
 logger = logging.getLogger(__name__)
 
+_PROXY_ENV_KEYS = ('HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY', 'http_proxy', 'https_proxy', 'all_proxy')
+
+
+def _truncate_at_sentence(text, limit):
+    """在不超过 limit 字符的前提下，按句子边界截断文本。"""
+    if len(text) <= limit:
+        return text
+    chunk = text[:limit]
+    for sep in ['\n\n', '。', '！', '？', '\n', '.', '!', '?', '…']:
+        idx = chunk.rfind(sep)
+        if idx > limit // 3:
+            return chunk[:idx + len(sep)]
+    return chunk
+
+
 class CoverProcessor:
     def __init__(self, config):
         self.config = config
         
-    def _call_glm(self, messages, max_tokens=512):
+    def _call_glm(self, messages, max_tokens=512, timeout=30):
         """Calls GLM-4-Flash. Returns response text or None on failure."""
         api_key = self.config.get('zhipu', {}).get('api_key', '')
         if not api_key:
             return None
+        _saved = {k: os.environ.pop(k, None) for k in _PROXY_ENV_KEYS}
         try:
             from zhipuai import ZhipuAI
             client = ZhipuAI(api_key=api_key)
@@ -20,12 +36,16 @@ class CoverProcessor:
                 model="glm-4-flash",
                 messages=messages,
                 max_tokens=max_tokens,
-                timeout=15
+                timeout=timeout
             )
             return resp.choices[0].message.content.strip()
         except Exception as e:
             logger.error(f"GLM API call failed: {e}")
             return None
+        finally:
+            for k, v in _saved.items():
+                if v is not None:
+                    os.environ[k] = v
 
     def translate_title(self, title):
         """Translates YouTube title to Chinese using GLM-4-Flash."""
@@ -44,11 +64,14 @@ class CoverProcessor:
     def translate_description(self, desc):
         """Translates YouTube description to Chinese using GLM-4-Flash."""
         if not desc: return ""
+        # 按句子边界截断输入，避免切断句子，同时控制 API 输入长度
+        truncated = _truncate_at_sentence(desc, 1200)
         result = self._call_glm([{
             "role": "user",
-            "content": f"将以下YouTube视频简介翻译成中文，只输出翻译结果，不要解释：{desc[:3000]}"
-        }], max_tokens=1000)
+            "content": f"将以下YouTube视频简介翻译成中文，只输出翻译结果，不要解释：{truncated}"
+        }], max_tokens=2000, timeout=60)
         return result if result else desc
+
 
     def get_summary(self, title_cn):
         """Calls GLM-4-Flash to extract 4-6 meaningful Chinese characters from the title."""

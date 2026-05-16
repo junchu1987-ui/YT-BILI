@@ -150,23 +150,30 @@ document.getElementById('btn-cancel').addEventListener('click', async () => {
 });
 
 // ── Pipeline renderer ─────────────────────────────────────────────────────────
-const stepIds = ['scan', 'download', 'transcode', 'translate', 'upload'];
+function effectiveStatus() {
+  if (S.status === 'idle' && S.pipeline_active) return 'pipeline';
+  return S.status;
+}
+const stepIds = ['scan', 'pipeline'];
 const stepMap = {
-  idle:            { active: 'scan' },
-  scanning:        { active: 'scan', busy: true },
-  scan_done:       { done: ['scan'], active: 'download' },
-  downloading:     { done: ['scan'], active: 'download', busy: true },
-  download_done:   { done: ['scan','download'], active: 'transcode' },
-  transcoding:     { done: ['scan','download'], active: 'transcode', busy: true },
-  transcode_done:  { done: ['scan','download','transcode'], active: 'translate' },
-  translating:     { done: ['scan','download','transcode'], active: 'translate', busy: true },
-  translate_done:  { done: ['scan','download','transcode','translate'], active: 'upload' },
-  uploading:       { done: ['scan','download','transcode','translate'], active: 'upload', busy: true },
-  done:            { done: ['scan','download','transcode','translate','upload'] },
+  idle:           { active: 'scan' },
+  scanning:       { active: 'scan', busy: true },
+  scan_done:      { done: ['scan'], active: 'pipeline' },
+  pipeline:       { done: ['scan'], active: 'pipeline', busy: true },
+  pipeline_done:  { done: ['scan', 'pipeline'] },
+  // backward compat — old states produced by retry flow map to new 2-step UI
+  downloading:    { done: ['scan'], active: 'pipeline', busy: true },
+  download_done:  { done: ['scan', 'pipeline'] },
+  transcoding:    { done: ['scan'], active: 'pipeline', busy: true },
+  transcode_done: { done: ['scan', 'pipeline'] },
+  translating:    { done: ['scan'], active: 'pipeline', busy: true },
+  translate_done: { done: ['scan', 'pipeline'] },
+  uploading:      { done: ['scan'], active: 'pipeline', busy: true },
+  done:           { done: ['scan', 'pipeline'] },
 };
 
 function renderPipeline() {
-  const sm = stepMap[S.status] || stepMap.idle;
+  const sm = stepMap[effectiveStatus()] || stepMap.idle;
   
   const btnCancel = document.getElementById('btn-cancel');
   if (sm.busy) {
@@ -201,7 +208,7 @@ function renderPipeline() {
 function renderActionPanel(sm) {
   const panel = document.getElementById('action-panel');
 
-  const status = S.status;
+  const status = effectiveStatus();
   let html = '';
 
   if (status === 'idle') {
@@ -227,95 +234,53 @@ function renderActionPanel(sm) {
         <div class="result-stat ok"><span class="num">${newCnt}</span>个新视频</div>
         <div class="result-stat skip"><span class="num">${skipCnt}</span>个已跳过</div>
       </div>
-      <div class="action-desc">勾选要下载的视频，然后点击开始下载。</div>
+      <div class="action-desc">勾选要处理的视频，为每个视频选择选项，然后开始。</div>
       <div class="action-footer">
-        <button class="btn btn-primary" onclick="doDownload()" ${newCnt===0?'disabled':''}>⬇ 开始下载</button>
+        <button class="btn btn-primary" onclick="doPipeline()" ${newCnt===0?'disabled':''}>⬇ 开始下载转码</button>
         <button class="btn btn-ghost" onclick="doScan()">重新扫描</button>
-        <label class="auto-transcode-label"><input type="checkbox" id="chk-auto-transcode"> 下载后自动转码</label>
-        <label class="auto-transcode-label"><input type="checkbox" id="chk-subtitles" checked> 下载字幕</label>
+        <button class="btn btn-ghost" onclick="showScheduleModal()" title="按间隔批量分配定时发布时间">📅 自动排班</button>
       </div>`;
 
-  } else if (status === 'downloading') {
+  } else if (status === 'pipeline') {
+    const pc = S.pipeline_counts || {};
+    const dl = pc.download || {};
+    const tc = pc.transcode || {};
+    const tr = pc.translate || {};
+    const up = pc.upload || {};
     html = `
-      <div class="action-title">正在下载...</div>
-      <div class="action-desc" id="dl-status-text">准备中...</div>
-      <div class="action-footer"><div class="spinner"></div></div>`;
-
-  } else if (status === 'download_done') {
-    const okCnt = S.downloaded.length;
-    const errCnt = S.errors.filter(e => e.step==='download').length;
-    html = `
-      <div class="action-title">下载完成</div>
-      <div class="result-summary">
-        <div class="result-stat ok"><span class="num">${okCnt}</span>成功</div>
-        ${errCnt?`<div class="result-stat fail"><span class="num">${errCnt}</span>失败</div>`:''}
+      <div class="action-title">流水线运行中...</div>
+      <div class="pipeline-status-summary">
+        <span>⬇ 下载 ${dl.done||0}/${dl.queued||'?'}</span>
+        <span>⚙ 转码 ${tc.done||0}</span>
+        <span>🌐 翻译 ${tr.done||0}</span>
+        <span>⬆ 上传 ${up.done||0}</span>
       </div>
-      <div class="action-desc">确认后开始转码（添加片头 + H264 标准化）。</div>
-      <div class="action-footer">
-        <button class="btn btn-primary" onclick="doTranscode()" ${okCnt===0?'disabled':''}>🎬 开始转码</button>
-      </div>`;
-
-  } else if (status === 'transcoding') {
-    html = `
-      <div class="action-title">正在转码...</div>
-      <div class="action-desc">添加片头并统一编码为 H264，请耐心等待。</div>
-      <div class="action-footer"><div class="spinner"></div></div>`;
-
-  } else if (status === 'transcode_done') {
-    const okCnt = S.transcoded.length;
-    const errCnt = S.errors.filter(e => e.step==='transcode').length;
-    html = `
-      <div class="action-title">转码完成</div>
-      <div class="result-summary">
-        <div class="result-stat ok"><span class="num">${okCnt}</span>成功</div>
-        ${errCnt?`<div class="result-stat fail"><span class="num">${errCnt}</span>失败</div>`:''}
-      </div>
-      <div class="action-desc">点击开始 AI 翻译视频标题，翻译完成后可上传。</div>
-      <div class="action-footer">
-        <button class="btn btn-primary" onclick="doTranslate()" ${okCnt===0?'disabled':''}>🌐 开始翻译</button>
-        <button class="btn btn-ghost" onclick="doRescan()">🔍 重新扫描队列</button>
-      </div>`;
-
-  } else if (status === 'translating') {
-    html = `
-      <div class="action-title">正在翻译标题...</div>
-      <div class="action-desc">调用 AI 翻译各视频标题，请稍候。</div>
       <div class="action-footer"><div class="spinner"></div><span style="color:var(--text2)">请稍候</span></div>`;
 
-  } else if (status === 'translate_done') {
-    const okCnt = S.transcoded.length;
-    const errCnt = S.errors.filter(e => e.step==='translate').length;
+  } else if (['pipeline_done', 'transcode_done', 'translate_done', 'done'].includes(status)) {
+    const pendingList = (S.transcoded || []).filter(c => !(S.uploaded||[]).some(u => u.id === c.id));
+    const pendingCnt = pendingList.length;
+    const uploadedCnt = (S.uploaded || []).length;
+    const errCnt = (S.errors || []).filter(e => ['transcode','translate','upload'].includes(e.step)).length;
     html = `
-      <div class="action-title">翻译完成</div>
+      <div class="action-title">${uploadedCnt > 0 && pendingCnt === 0 ? '🎉 全部完成！' : '流水线完成'}</div>
       <div class="result-summary">
-        <div class="result-stat ok"><span class="num">${okCnt}</span>待上传</div>
-        ${errCnt?`<div class="result-stat fail"><span class="num">${errCnt}</span>翻译失败</div>`:''}
+        ${pendingCnt ? `<div class="result-stat ok"><span class="num">${pendingCnt}</span>待上传</div>` : ''}
+        ${uploadedCnt ? `<div class="result-stat ok"><span class="num">${uploadedCnt}</span>已上传</div>` : ''}
+        ${errCnt ? `<div class="result-stat fail"><span class="num">${errCnt}</span>失败</div>` : ''}
       </div>
-      <div class="action-desc">确认标题无误后上传至 B站，也可对单条视频重新翻译。</div>
       <div class="action-footer">
-        <button class="btn btn-green" onclick="doUpload()" ${okCnt===0?'disabled':''}>🚀 上传至 B站</button>
-        <button class="btn btn-ghost" onclick="doTranslate()">🔄 重新翻译全部</button>
+        ${pendingCnt ? `<button class="btn btn-green" onclick="doUploadAll()">🚀 全部上传</button>` : ''}
+        <button class="btn btn-ghost" onclick="doTranslate()">🌐 重新翻译全部</button>
         <button class="btn btn-ghost" onclick="doRescan()">🔍 重新扫描队列</button>
+        <button class="btn btn-ghost" onclick="doScan()">重新扫描来源</button>
       </div>`;
 
-  } else if (status === 'uploading') {
+  } else {
+    // Legacy busy states from retry flow
     html = `
-      <div class="action-title">正在上传...</div>
-      <div class="action-desc">视频上传中，请保持网络稳定。</div>
+      <div class="action-title">处理中...</div>
       <div class="action-footer"><div class="spinner"></div></div>`;
-
-  } else if (status === 'done') {
-    const okCnt = S.uploaded.length;
-    const errCnt = S.errors.filter(e => e.step==='upload').length;
-    html = `
-      <div class="action-title">🎉 全部完成！</div>
-      <div class="result-summary">
-        <div class="result-stat ok"><span class="num">${okCnt}</span>视频上传成功</div>
-        ${errCnt?`<div class="result-stat fail"><span class="num">${errCnt}</span>失败</div>`:''}
-      </div>
-      <div class="action-footer">
-        <button class="btn btn-ghost" onclick="doReset()">↺ 开始新一轮</button>
-      </div>`;
   }
 
   panel.innerHTML = html;
@@ -326,7 +291,7 @@ function renderVideoSection() {
   const listEl  = document.getElementById('video-list');
   const titleEl = document.getElementById('video-list-title');
   const selWrap  = document.getElementById('select-all-wrap');
-  const status = S.status;
+  const status = effectiveStatus();
 
   // Choose which list to show
   let items = [];
@@ -337,19 +302,19 @@ function renderVideoSection() {
     titleEl.textContent = '发现的视频';
     showCheckbox = true;
     selWrap.style.display = '';
-  } else if (['transcode_done', 'translating', 'translate_done', 'uploading', 'done'].includes(status)) {
+  } else if (['pipeline_done', 'transcode_done', 'translating', 'translate_done', 'uploading', 'done'].includes(status)) {
     items = S.transcoded;
     titleEl.textContent = '处理进度';
     showCheckbox = false;
     selWrap.style.display = 'none';
-  } else if (['downloading', 'download_done', 'transcoding'].includes(status)) {
+  } else if (['pipeline', 'downloading', 'download_done', 'transcoding'].includes(status)) {
     items = S.candidates.filter(c => !c.already_downloaded);
     titleEl.textContent = '处理进度';
     showCheckbox = false;
     selWrap.style.display = 'none';
   }
 
-  if (items.length === 0 && !['scan_done','downloading','download_done','transcoding','transcode_done','uploading','done'].includes(status)) {
+  if (items.length === 0 && !['scan_done','pipeline','downloading','download_done','transcoding','pipeline_done','transcode_done','uploading','done'].includes(status)) {
     section.style.display = 'none';
     return;
   }
@@ -464,16 +429,18 @@ function renderVideoSection() {
     const fmtToggleBtn = showFmtToggle
         ? `<button class="btn-fmt-toggle" data-vid="${c.id}"><span class="fmt-sel-label">${escHtml(selectedLabel)}</span><span class="fmt-arrow">${expanded ? '▲' : '▼'}</span></button>`
         : '';
-    const showMetaToggle = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
+    const canInteract = ['pipeline_done','transcode_done','translate_done'].includes(status)
+                     || (status === 'pipeline' && isTranscoded);
+    const showMetaToggle = canInteract && isTranscoded && !isUploaded;
     const metaExp = !!S.metaExpanded[c.id];
     const metaToggleBtn = showMetaToggle
         ? `<button class="btn-meta-toggle" data-vid="${c.id}">编辑 <span class="fmt-arrow">${metaExp ? '▲' : '▼'}</span></button>`
         : '';
-    const showDelBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
-    const showDoneBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
-    const showUploadBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
-    const showRetranslateBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded;
-    const showStagesBtn = ['transcode_done','translate_done'].includes(status) && isTranscoded;
+    const showDelBtn = canInteract && isTranscoded && !isUploaded;
+    const showDoneBtn = canInteract && isTranscoded && !isUploaded;
+    const showUploadBtn = canInteract && isTranscoded && !isUploaded;
+    const showRetranslateBtn = canInteract && isTranscoded && !isUploaded;
+    const showStagesBtn = canInteract && isTranscoded;
     const displayTitle = (S.videoMeta[c.id] && S.videoMeta[c.id].title) ? S.videoMeta[c.id].title : (c.translated_title || c.title);
     const showOrigTitle = displayTitle !== c.title;
     itemRow.innerHTML = `
@@ -518,6 +485,51 @@ function renderVideoSection() {
     }
     
     row.appendChild(itemRow);
+
+    // Per-video options row (scan_done, not skipped)
+    if (status === 'scan_done' && !isSkip) {
+        // Initialize defaults on candidate object
+        if (c.with_subtitles === undefined) c.with_subtitles = true;
+        if (c.auto_upload    === undefined) c.auto_upload    = false;
+
+        const toLocal = d => new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+        const minDt = toLocal(new Date(Date.now() + 4 * 3600 * 1000 + 60000));
+        const existingSched = S.videoMeta[c.id]?.schedule_time || '';
+
+        const optRow = document.createElement('div');
+        optRow.className = 'prescan-options-row';
+        optRow.innerHTML = `
+          <label class="prescan-opt-label">
+            <input type="checkbox" class="prescan-subtitles" ${c.with_subtitles ? 'checked' : ''}> 下载字幕
+          </label>
+          <label class="prescan-opt-label">
+            <input type="checkbox" class="prescan-auto-upload" ${c.auto_upload ? 'checked' : ''}> 自动上传
+          </label>
+          <span class="sched-label">📅 定时</span>
+          <input type="datetime-local" class="prescan-sched-input" data-vid="${c.id}"
+                 value="${escHtml(existingSched)}" min="${minDt}" title="留空 = 立即发布">
+          <button class="btn-tiny sched-clear-btn" title="清除定时">✕</button>`;
+
+        optRow.querySelector('.prescan-subtitles').addEventListener('change', e => {
+            c.with_subtitles = e.target.checked;
+        });
+        optRow.querySelector('.prescan-auto-upload').addEventListener('change', e => {
+            c.auto_upload = e.target.checked;
+        });
+        const dtInput = optRow.querySelector('.prescan-sched-input');
+        const clearBtn = optRow.querySelector('.sched-clear-btn');
+        dtInput.addEventListener('change', () => {
+            if (!S.videoMeta[c.id]) S.videoMeta[c.id] = {};
+            S.videoMeta[c.id].schedule_time = dtInput.value || null;
+            api('POST', `/api/prescan_meta/${c.id}`, { schedule_time: dtInput.value || null }).catch(() => {});
+        });
+        clearBtn.addEventListener('click', () => {
+            dtInput.value = '';
+            if (S.videoMeta[c.id]) S.videoMeta[c.id].schedule_time = null;
+            api('POST', `/api/prescan_meta/${c.id}`, { schedule_time: null }).catch(() => {});
+        });
+        row.appendChild(optRow);
+    }
 
     // Formats List (only for scan_done and not skipped)
     if (showFmtToggle) {
@@ -590,7 +602,7 @@ function renderVideoSection() {
     }
 
     // Upload meta editor (only when waiting for upload)
-    if (['transcode_done','translate_done'].includes(status) && isTranscoded && !isUploaded) {
+    if (canInteract && isTranscoded && !isUploaded) {
         if (!S.videoMeta[c.id]) {
             S.videoMeta[c.id] = {
                 title: c.translated_title || c.title || '',
@@ -763,7 +775,6 @@ function renderVideoSection() {
         row.appendChild(editor);
     }
 
-    // Stages editor
     if (showStagesBtn) {
         const stagesEditor = document.createElement('div');
         stagesEditor.className = 'stages-editor collapsed';
@@ -848,6 +859,32 @@ async function jumpToStep(step) {
   if (r && r.error) alert(r.error);
 }
 async function doScan() { selectedIds.clear(); await api('POST', '/api/scan'); }
+
+async function doPipeline() {
+  const ids = [...selectedIds];
+  if (!ids.length) { alert('请至少选择一个视频'); return; }
+
+  const payload = ids.map(id => {
+    const c = S.candidates.find(x => x.id === id);
+    const selFormats = S.selectedFormats[id];
+    let format_id = null;
+    if (selFormats && selFormats.size > 0) {
+      format_id = [...selFormats].join('+');
+    } else if (c && c.rec_format_id) {
+      format_id = c.rec_format_id;
+    }
+    return {
+      id,
+      format_id,
+      quality: 'custom',
+      with_subtitles: c?.with_subtitles !== false,
+      auto_upload:    c?.auto_upload === true,
+    };
+  });
+
+  await api('POST', '/api/pipeline/start', { video_ids: payload });
+}
+
 async function doDownload() {
   const ids = [...selectedIds];
   if (!ids.length) { alert('请至少选择一个视频'); return; }
@@ -867,11 +904,11 @@ async function doDownload() {
 
     return { id: id, format_id: format_id, quality: 'custom' };
   });
-  
+
   await api('POST', '/api/download', { video_ids: payload, auto_transcode: autoTranscode, with_subtitles: withSubtitles });
 }
 async function doTranscode() { await api('POST', '/api/transcode'); }
-async function doUpload() {
+async function doUploadAll() {
   const meta = {};
   S.transcoded.forEach(c => {
     const m = S.videoMeta[c.id];
@@ -879,6 +916,7 @@ async function doUpload() {
   });
   await api('POST', '/api/upload', { meta });
 }
+async function doUpload() { await doUploadAll(); }
 async function doReset()     { await api('POST', '/api/reset'); }
 async function doTranslate() {
   await api('POST', '/api/translate');
@@ -891,6 +929,64 @@ async function doRescan() {
   else appendLog(ts, 'info', '重新扫描完成，没有发现新视频');
 }
 async function doRetry(id)     { await api('POST', '/api/retry', { video_id: id }); }
+
+// ── Schedule modal (auto-assign publish times) ─────────────────────────────
+function showScheduleModal() {
+  const ids = [...selectedIds].filter(id => !S.candidates.find(c => c.id === id)?.already_downloaded);
+  if (!ids.length) { alert('请先勾选要排班的视频'); return; }
+
+  const existing = document.getElementById('schedule-modal');
+  if (existing) existing.remove();
+
+  const defaultStart = new Date(Date.now() + 5 * 3600 * 1000);
+  const toLocal = d => new Date(d - d.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+
+  const modal = document.createElement('div');
+  modal.id = 'schedule-modal';
+  modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.5);z-index:9999;display:flex;align-items:center;justify-content:center';
+  modal.innerHTML = `
+    <div style="background:var(--bg2);border-radius:12px;padding:24px;min-width:320px;box-shadow:0 8px 32px rgba(0,0,0,.4)">
+      <div style="font-weight:600;margin-bottom:16px">📅 自动排班（${ids.length} 个视频）</div>
+      <div class="meta-field" style="margin-bottom:12px">
+        <label>起始时间</label>
+        <input type="datetime-local" id="sched-start" value="${toLocal(defaultStart)}" style="width:100%">
+      </div>
+      <div class="meta-field" style="margin-bottom:16px">
+        <label>间隔（分钟）</label>
+        <input type="number" id="sched-interval" value="120" min="10" style="width:120px">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:flex-end">
+        <button class="btn btn-ghost" onclick="document.getElementById('schedule-modal').remove()">取消</button>
+        <button class="btn btn-primary" onclick="applySchedule()">确定</button>
+      </div>
+    </div>`;
+  document.body.appendChild(modal);
+}
+
+async function applySchedule() {
+  const startInput = document.getElementById('sched-start');
+  const intervalInput = document.getElementById('sched-interval');
+  if (!startInput || !intervalInput) return;
+
+  const startMs = new Date(startInput.value).getTime();
+  const intervalMs = (parseInt(intervalInput.value) || 120) * 60 * 1000;
+  if (isNaN(startMs)) { alert('请输入有效的起始时间'); return; }
+
+  const ids = [...selectedIds].filter(id => !S.candidates.find(c => c.id === id)?.already_downloaded);
+  const promises = ids.map((id, i) => {
+    const dt = new Date(startMs + i * intervalMs);
+    const isoLocal = new Date(dt - dt.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+    if (!S.videoMeta[id]) S.videoMeta[id] = {};
+    S.videoMeta[id].schedule_time = isoLocal;
+    return api('POST', `/api/prescan_meta/${id}`, { schedule_time: isoLocal });
+  });
+  await Promise.all(promises);
+
+  document.getElementById('schedule-modal')?.remove();
+  renderVideoSection();
+  const ts = new Date().toLocaleTimeString('zh-CN', {hour12: false});
+  appendLog(ts, 'info', `已为 ${ids.length} 个视频分配定时发布时间`);
+}
 
 // ── Sources tab ───────────────────────────────────────────────────────────────
 async function loadSources() {
@@ -953,6 +1049,14 @@ async function deleteSource(idx) {
   await api('DELETE', `/api/sources/${idx}`);
   loadSources();
 }
+
+async function clearSources() {
+  if (!confirm('确定清除全部来源？')) return;
+  await api('DELETE', '/api/sources');
+  loadSources();
+}
+
+document.getElementById('btn-clear-sources').addEventListener('click', clearSources);
 
 // ── History tab ───────────────────────────────────────────────────────────────
 async function loadHistory() {
