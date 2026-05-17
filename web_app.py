@@ -46,6 +46,7 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 state_lock = threading.Lock()
 history_lock = threading.Lock()
+_meta_lock = threading.Lock()  # 保护 video_meta.json 的所有读写操作
 # Global state for pipeline
 S = {
     'status': 'idle',      # idle, scanning, scan_done, downloading, download_done, transcoding, transcode_done, uploading, done
@@ -210,13 +211,14 @@ def _update_stage(work_dir, vid, stage, status):
     stage: 'scan'|'download'|'transcode'|'translate'|'upload'
     status: 'pending'|'done'|'failed'|'skipped'
     """
-    meta = _load_video_meta(work_dir)
-    if vid not in meta:
-        return
-    if 'stages' not in meta[vid]:
-        meta[vid]['stages'] = {}
-    meta[vid]['stages'][stage] = {'status': status, 'at': int(time.time())}
-    _save_video_meta(work_dir, meta)
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
+        if vid not in meta:
+            return
+        if 'stages' not in meta[vid]:
+            meta[vid]['stages'] = {}
+        meta[vid]['stages'][stage] = {'status': status, 'at': int(time.time())}
+        _save_video_meta(work_dir, meta)
     with state_lock:
         if vid in S['video_meta']:
             if 'stages' not in S['video_meta'][vid]:
@@ -227,7 +229,6 @@ def _queue_for_upload(c):
     """转码成功后写入 video_meta.json，不覆盖用户已编辑的字段。"""
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
-    meta = _load_video_meta(work_dir)
     vid = c['id']
     safe_title = slugify(c['title'])
     vid_dir = os.path.join(work_dir, f"{safe_title}_{vid[:8]}")
@@ -238,37 +239,40 @@ def _queue_for_upload(c):
         if os.path.exists(t):
             thumb = t
             break
-    if vid not in meta:
-        meta[vid] = {
-            'title': c.get('translated_title') or c['title'],
-            'original_title': c['title'],
-            'tid': cfg['bilibili'].get('tid', 122),
-            'tags': list(cfg['bilibili'].get('default_tags', [])),
-            'copyright': 1,
-            'source': c['url'],
-            'schedule_time': None,
-            'uploaded': False,
-            'local_path': final_path,
-            'original_thumbnail': thumb,
-            'url': c['url'],
-            'queued_at': int(time.time()),
-            'stages': {
-                'scan':      {'status': 'done',    'at': int(time.time())},
-                'download':  {'status': 'done',    'at': int(time.time())},
-                'transcode': {'status': 'done',    'at': int(time.time())},
-                'translate': {'status': 'pending', 'at': None},
-                'upload':    {'status': 'pending', 'at': None},
-            },
-        }
-    else:
-        # 更新翻译标题（如果有），以及 local_path/thumbnail（路径可能变化）
-        translated = c.get('translated_title')
-        if translated:
-            meta[vid]['title'] = translated
-        meta[vid]['local_path'] = final_path
-        if thumb:
-            meta[vid]['original_thumbnail'] = thumb
-    _save_video_meta(work_dir, meta)
+
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
+        if vid not in meta:
+            meta[vid] = {
+                'title': c.get('translated_title') or c['title'],
+                'original_title': c['title'],
+                'tid': cfg['bilibili'].get('tid', 122),
+                'tags': list(cfg['bilibili'].get('default_tags', [])),
+                'copyright': 1,
+                'source': c['url'],
+                'schedule_time': None,
+                'uploaded': False,
+                'local_path': final_path,
+                'original_thumbnail': thumb,
+                'url': c['url'],
+                'queued_at': int(time.time()),
+                'stages': {
+                    'scan':      {'status': 'done',    'at': int(time.time())},
+                    'download':  {'status': 'done',    'at': int(time.time())},
+                    'transcode': {'status': 'done',    'at': int(time.time())},
+                    'translate': {'status': 'pending', 'at': None},
+                    'upload':    {'status': 'pending', 'at': None},
+                },
+            }
+        else:
+            # 只更新 local_path/thumbnail/title，绝不覆盖 schedule_time/tid/tags 等用户设置
+            translated = c.get('translated_title')
+            if translated:
+                meta[vid]['title'] = translated
+            meta[vid]['local_path'] = final_path
+            if thumb:
+                meta[vid]['original_thumbnail'] = thumb
+        _save_video_meta(work_dir, meta)
     with state_lock:
         S['video_meta'][vid] = meta[vid]
 
@@ -307,10 +311,45 @@ def restore_state():
         if m.get('uploaded'):
             continue
 
+        # 入队超过5天未上传，自动标记为已上传（视为过期放弃）
+        queued_at = m.get('queued_at') or 0
+        if queued_at and (time.time() - queued_at) > 5 * 24 * 3600:
+            meta[vid]['uploaded'] = True
+            meta[vid]['uploaded_at'] = int(time.time())
+            dirty = True
+            logging.info(f"restore_state: {vid} 入队超5天未上传，自动标记已上传")
+            continue
+
         stages = m.get('stages', {})
+        has_stages = bool(stages)
         scan_st   = stages.get('scan',      {}).get('status', 'pending')
         dl_st     = stages.get('download',  {}).get('status', 'pending')
         tc_st     = stages.get('transcode', {}).get('status', 'pending')
+
+        # 旧条目无 stages 字段：根据 local_path 是否存在决定恢复到哪里
+        if not has_stages:
+            lp = m.get('local_path', '')
+            if lp and not os.path.isabs(lp):
+                lp = os.path.join(os.path.dirname(os.path.abspath(__file__)), lp)
+            if lp and os.path.isfile(lp) and os.path.getsize(lp) >= 1024 * 1024:
+                c = {
+                    'id': vid,
+                    'title': m.get('original_title') or m.get('title', ''),
+                    'translated_title': m.get('title', ''),
+                    'description': scan_cache.get(vid, {}).get('description', ''),
+                    'url': m.get('url', f'https://www.youtube.com/watch?v={vid}'),
+                    'url_type': 'video',
+                    'already_downloaded': True,
+                    'formats': scan_cache.get(vid, {}).get('formats', []),
+                    'rec_format_id': scan_cache.get(vid, {}).get('rec_format_id'),
+                    'original_thumbnail': m.get('original_thumbnail'),
+                    'local_path': lp,
+                    'local_dir': os.path.dirname(lp),
+                }
+                transcoded_restored.append(c)
+                downloaded_restored.append(c)
+            # 无文件的旧条目跳过（不删除，不加入恢复列表）
+            continue
 
         # Reset any "running" stages to "pending" (crash recovery)
         if dl_st == 'running':
@@ -379,7 +418,8 @@ def restore_state():
             candidates_restored.append(c)
 
     if dirty:
-        _save_video_meta(work_dir, meta)
+        with _meta_lock:
+            _save_video_meta(work_dir, meta)
 
     if transcoded_restored or downloaded_restored or candidates_restored:
         with state_lock:
@@ -397,6 +437,7 @@ def restore_state():
             f"State restored: {len(candidates_restored)} candidates, "
             f"{len(downloaded_restored)} downloaded, {len(transcoded_restored)} transcoded."
         )
+        print(f"[restore_state] candidates={len(candidates_restored)} downloaded={len(downloaded_restored)} transcoded={len(transcoded_restored)} status={S['status']}", flush=True)
 
 # ── Pipeline Core ─────────────────────────────────────────────────────────────
 def run_scan():
@@ -601,8 +642,10 @@ def run_scan():
         # Merge with existing candidates (if any)
         with state_lock:
             S['candidates'] = new_candidates
+            # If there are already transcoded videos in memory, stay in pipeline_done
+            new_status = 'pipeline_done' if S['transcoded'] else 'scan_done'
         log_to_web('info', f"扫描完成，发现 {len(new_candidates)} 个候选视频。")
-        update_state('scan_done')
+        update_state(new_status)
     except Exception as e:
         log_to_web('error', f"扫描阶段崩溃: {str(e)}")
         update_state('idle')
@@ -947,19 +990,20 @@ def _translate_one(c, cfg, cover_proc, desc_prefix):
     vid = c['id']
     work_dir = cfg['app']['work_dir']
 
-    log_to_web('info', f"翻译标题: {c['title']}", vid)
     _update_stage(work_dir, vid, 'translate', 'running')
+
+    # ── 锁外执行所有耗时的 API 调用，收集结果 ──────────────────────────
+    translated = None
+    final_desc = None
+    cover_text = None
+    source_url = c.get('url', '')
+
+    log_to_web('info', f"翻译标题: {c['title']}", vid)
     try:
-        translated = cover_proc.translate_title(c['title'])
-        if translated and translated != c['title']:
+        result = cover_proc.translate_title(c['title'])
+        if result and result != c['title']:
+            translated = result
             c['translated_title'] = translated
-            meta = _load_video_meta(work_dir)
-            if vid in meta:
-                meta[vid]['title'] = translated
-                _save_video_meta(work_dir, meta)
-                with state_lock:
-                    if vid in S['video_meta']:
-                        S['video_meta'][vid]['title'] = translated
             log_to_web('info', f"翻译完成: {translated}", vid)
         else:
             log_to_web('warn', f"翻译结果为空或与原文相同，跳过", vid)
@@ -969,7 +1013,6 @@ def _translate_one(c, cfg, cover_proc, desc_prefix):
     log_to_web('info', f"翻译简介...", vid)
     try:
         original_desc = c.get('description', '')
-        source_url = c.get('url', '')
         if original_desc:
             try:
                 translated_desc = cover_proc.translate_description(original_desc)
@@ -978,32 +1021,50 @@ def _translate_one(c, cfg, cover_proc, desc_prefix):
                 translated_desc = original_desc
             final_desc = f"{translated_desc}\n\n{desc_prefix.replace('{youtube_url}', source_url)}"
             final_desc = _truncate_at_sentence(final_desc, 2000)
-            meta = _load_video_meta(work_dir)
-            if vid in meta:
-                meta[vid]['desc'] = final_desc
-                _save_video_meta(work_dir, meta)
-            with state_lock:
-                if vid in S['video_meta']:
-                    S['video_meta'][vid]['desc'] = final_desc
             log_to_web('info', f"简介处理完成 ({len(final_desc)} 字)", vid)
-        else:
-            # 无原始描述（重启后还原的视频）——只在没有已存简介时才设置默认前缀，不覆盖用户已有内容
-            meta = _load_video_meta(work_dir)
-            if vid in meta and not meta[vid].get('desc'):
-                final_desc = desc_prefix.replace('{youtube_url}', source_url)
-                final_desc = _truncate_at_sentence(final_desc, 2000)
-                if final_desc:
-                    meta[vid]['desc'] = final_desc
-                    _save_video_meta(work_dir, meta)
-                    with state_lock:
-                        if vid in S['video_meta']:
-                            S['video_meta'][vid]['desc'] = final_desc
-            else:
-                log_to_web('info', f"无原始简介，跳过简介翻译（保留已有内容）", vid)
     except Exception as e:
         log_to_web('error', f"简介处理失败: {e}", vid)
 
+    translated_title = translated or c.get('title', '')
+    if translated_title:
+        try:
+            cover_text = cover_proc.get_summary(translated_title)
+            if cover_text:
+                log_to_web('info', f"封面文字: {cover_text}", vid)
+        except Exception as e:
+            log_to_web('warn', f"封面文字生成失败: {e}", vid)
+
+    # ── 一次加锁，统一写盘 ────────────────────────────────────────────
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
+        if vid in meta:
+            if translated:
+                meta[vid]['title'] = translated
+            if final_desc:
+                meta[vid]['desc'] = final_desc
+            elif not c.get('description') and not meta[vid].get('desc'):
+                # 无原始描述且无已存简介，写默认前缀
+                default_desc = desc_prefix.replace('{youtube_url}', source_url)
+                default_desc = _truncate_at_sentence(default_desc, 2000)
+                if default_desc:
+                    meta[vid]['desc'] = default_desc
+                    final_desc = default_desc
+            if cover_text:
+                meta[vid]['cover_text'] = cover_text
+            _save_video_meta(work_dir, meta)
+
+    # 同步内存
+    with state_lock:
+        if vid in S['video_meta']:
+            if translated:
+                S['video_meta'][vid]['title'] = translated
+            if final_desc:
+                S['video_meta'][vid]['desc'] = final_desc
+            if cover_text:
+                S['video_meta'][vid]['cover_text'] = cover_text
+
     _update_stage(work_dir, vid, 'translate', 'done')
+
 
 
 def run_translate(vids=None):
@@ -1094,14 +1155,15 @@ def _do_upload_single(vid, c, uploader, cfg):
         with state_lock:
             S['uploaded'].append(c)
         add_history(vid)
-        um = _load_video_meta(work_dir)
-        if vid in um:
-            um[vid]['uploaded'] = True
-            um[vid]['uploaded_at'] = int(time.time())
-            if 'stages' not in um[vid]:
-                um[vid]['stages'] = {}
-            um[vid]['stages']['upload'] = {'status': 'done', 'at': int(time.time())}
-            _save_video_meta(work_dir, um)
+        with _meta_lock:
+            um = _load_video_meta(work_dir)
+            if vid in um:
+                um[vid]['uploaded'] = True
+                um[vid]['uploaded_at'] = int(time.time())
+                if 'stages' not in um[vid]:
+                    um[vid]['stages'] = {}
+                um[vid]['stages']['upload'] = {'status': 'done', 'at': int(time.time())}
+                _save_video_meta(work_dir, um)
         with state_lock:
             S['video_meta'].pop(vid, None)
             S['transcoded'] = [x for x in S['transcoded'] if x['id'] != vid]
@@ -1252,9 +1314,37 @@ def _allow_sleep():
     import ctypes
     ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)  # ES_CONTINUOUS only
 
+_mouse_jiggle_stop = None
+
+def _start_mouse_jiggle():
+    """每60秒移动鼠标1像素再移回来，防止企业版组策略强制自动锁屏。"""
+    global _mouse_jiggle_stop
+    import ctypes
+    stop_event = threading.Event()
+    _mouse_jiggle_stop = stop_event
+
+    def jiggle():
+        class POINT(ctypes.Structure):
+            _fields_ = [('x', ctypes.c_long), ('y', ctypes.c_long)]
+        while not stop_event.wait(60):
+            pt = POINT()
+            ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+            ctypes.windll.user32.SetCursorPos(pt.x + 1, pt.y)
+            ctypes.windll.user32.SetCursorPos(pt.x, pt.y)
+
+    t = threading.Thread(target=jiggle, daemon=True)
+    t.start()
+
+def _stop_mouse_jiggle():
+    global _mouse_jiggle_stop
+    if _mouse_jiggle_stop:
+        _mouse_jiggle_stop.set()
+        _mouse_jiggle_stop = None
+
 
 def run_pipeline(video_ids):
     _prevent_sleep()
+    _start_mouse_jiggle()
     try:
         update_state('pipeline')
         with state_lock:
@@ -1267,8 +1357,8 @@ def run_pipeline(video_ids):
                 'upload':    {'queued': 0, 'done': 0, 'failed': 0},
             }
 
-        download_q = Queue()
         global _pipeline_download_q
+        download_q = Queue()
         _pipeline_download_q = download_q
         transcode_q = Queue()
         translate_q = Queue()
@@ -1300,9 +1390,9 @@ def run_pipeline(video_ids):
         log_to_web('error', f"流水线崩溃: {str(e)}")
         update_state('scan_done')
     finally:
-        global _pipeline_download_q
         _pipeline_download_q = None
         _allow_sleep()
+        _stop_mouse_jiggle()
 
 # ── History Persistence ──────────────────────────────────────────────────────
 HISTORY_FILE = 'history.json'
@@ -1386,17 +1476,17 @@ def save_video_meta():
     incoming = data.get('meta', {})  # {vid: {title, tid, tags, ...}}
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
-    # Merge into persistent file — only update editable fields, preserve uploaded/local_path etc.
     EDITABLE = {'title', 'tid', 'tags', 'copyright', 'source', 'schedule_time', 'desc', 'cover_text'}
-    disk_meta = _load_video_meta(work_dir)
-    for vid, fields in incoming.items():
-        if vid in disk_meta:
-            for k, v in fields.items():
-                if k in EDITABLE:
-                    disk_meta[vid][k] = v
-        else:
-            disk_meta[vid] = fields
-    _save_video_meta(work_dir, disk_meta)
+    with _meta_lock:
+        disk_meta = _load_video_meta(work_dir)
+        for vid, fields in incoming.items():
+            if vid in disk_meta:
+                for k, v in fields.items():
+                    if k in EDITABLE:
+                        disk_meta[vid][k] = v
+            else:
+                disk_meta[vid] = fields
+        _save_video_meta(work_dir, disk_meta)
     with state_lock:
         for vid, fields in incoming.items():
             if vid in S['video_meta']:
@@ -1409,16 +1499,14 @@ def save_video_meta():
 def delete_video_meta(vid):
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
-    meta = _load_video_meta(work_dir)
-
-    # Find the source URL for this video before deleting
     source_url = None
-    if vid in meta:
-        source_url = meta[vid].get('url') or meta[vid].get('source')
-        del meta[vid]
-        _save_video_meta(work_dir, meta)
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
+        if vid in meta:
+            source_url = meta[vid].get('url') or meta[vid].get('source')
+            del meta[vid]
+            _save_video_meta(work_dir, meta)
 
-    # Remove the source URL from config.yaml if it's a single-video source
     if source_url:
         with _config_lock:
             cfg2 = load_config()
@@ -1448,18 +1536,18 @@ def update_stages(vid):
         return jsonify({'error': 'Invalid stage or status'}), 400
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
-    meta = _load_video_meta(work_dir)
-    if vid not in meta:
-        return jsonify({'error': 'Video not found'}), 404
-    if 'stages' not in meta[vid]:
-        meta[vid]['stages'] = {}
-    meta[vid]['stages'][stage] = {'status': status, 'at': int(time.time())}
-    # 同步 uploaded 字段（upload stage done ↔ uploaded: true）
-    if stage == 'upload':
-        meta[vid]['uploaded'] = (status == 'done')
-        if status == 'done' and not meta[vid].get('uploaded_at'):
-            meta[vid]['uploaded_at'] = int(time.time())
-    _save_video_meta(work_dir, meta)
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
+        if vid not in meta:
+            return jsonify({'error': 'Video not found'}), 404
+        if 'stages' not in meta[vid]:
+            meta[vid]['stages'] = {}
+        meta[vid]['stages'][stage] = {'status': status, 'at': int(time.time())}
+        if stage == 'upload':
+            meta[vid]['uploaded'] = (status == 'done')
+            if status == 'done' and not meta[vid].get('uploaded_at'):
+                meta[vid]['uploaded_at'] = int(time.time())
+        _save_video_meta(work_dir, meta)
     with state_lock:
         if vid in S['video_meta']:
             if 'stages' not in S['video_meta'][vid]:
@@ -1473,11 +1561,12 @@ def mark_upload_done(vid):
     """Manually mark a video as uploaded (for videos uploaded outside the app)."""
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
-    meta = _load_video_meta(work_dir)
-    if vid in meta:
-        meta[vid]['uploaded'] = True
-        meta[vid]['uploaded_at'] = int(time.time())
-        _save_video_meta(work_dir, meta)
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
+        if vid in meta:
+            meta[vid]['uploaded'] = True
+            meta[vid]['uploaded_at'] = int(time.time())
+            _save_video_meta(work_dir, meta)
     add_history(vid)
     with state_lock:
         S['video_meta'].pop(vid, None)
@@ -1493,83 +1582,103 @@ def rescan_upload_queue():
     if not os.path.isdir(work_dir):
         return jsonify({'added': 0})
 
-    meta = _load_video_meta(work_dir)
     scan_cache = _load_scan_cache(work_dir)
     added = 0
+    dirty = False
 
-    for entry in os.scandir(work_dir):
-        if not entry.is_dir(): continue
-        name = entry.name
-        if len(name) < 10 or name[-9] != '_': continue
-        vid8 = name[-8:]
-        safe_title = name[:-9]
-        vid_dir = entry.path
-        final_path = os.path.join(vid_dir, f"{safe_title}_final.mp4")
-        if not os.path.isfile(final_path) or os.path.getsize(final_path) < 1024 * 1024:
-            continue
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
 
-        matched_vid = next((v for v in scan_cache if v[:8] == vid8), None)
-        vid = matched_vid or vid8
-
-        if vid in meta:
-            continue  # Already in queue (uploaded or pending)
-
-        orig_title = scan_cache.get(vid, {}).get('title') or safe_title
-        thumb = None
-        for ext in ['webp', 'jpg', 'jpeg', 'png']:
-            t = os.path.join(vid_dir, f"{safe_title}.{ext}")
-            if os.path.exists(t): thumb = t; break
-
-        meta[vid] = {
-            'title': orig_title,
-            'original_title': orig_title,
-            'tid': cfg['bilibili'].get('tid', 122),
-            'tags': list(cfg['bilibili'].get('default_tags', [])),
-            'copyright': 1,
-            'source': f'https://www.youtube.com/watch?v={vid}',
-            'schedule_time': None,
-            'uploaded': False,
-            'local_path': final_path,
-            'original_thumbnail': thumb,
-            'url': f'https://www.youtube.com/watch?v={vid}',
-            'queued_at': int(time.time()),
-            'stages': {
-                'scan':      {'status': 'done',    'at': int(time.time())},
-                'download':  {'status': 'done',    'at': int(time.time())},
-                'transcode': {'status': 'done',    'at': int(time.time())},
-                'translate': {'status': 'pending', 'at': None},
-                'upload':    {'status': 'pending', 'at': None},
-            },
-        }
-        added += 1
-
-    if added:
-        _save_video_meta(work_dir, meta)
-        # Rebuild S['transcoded'] from updated meta
-        restored = []
+        # 先用 history.json 校正 uploaded 字段，防止并发写盘导致的字段丢失
+        hist_ids = get_history()
         for vid, m in meta.items():
-            if m.get('uploaded'): continue
-            lp = m.get('local_path', '')
-            if not os.path.isfile(lp): continue
-            restored.append({
-                'id': vid,
-                'title': m.get('original_title') or m.get('title', ''),
-                'translated_title': m.get('title', ''),
-                'description': '',
-                'url': m.get('url', f'https://www.youtube.com/watch?v={vid}'),
-                'url_type': 'video',
-                'already_downloaded': True,
-                'formats': [],
-                'rec_format_id': None,
-                'local_path': lp,
-                'local_dir': os.path.dirname(lp),
-                'original_thumbnail': m.get('original_thumbnail'),
-            })
-        with state_lock:
-            S['transcoded'] = restored
-            S['video_meta'] = {v: m for v, m in meta.items() if not m.get('uploaded')}
-        update_state()
-        logging.info(f"rescan_upload_queue: added {added} new videos.")
+            if vid in hist_ids and not m.get('uploaded'):
+                meta[vid]['uploaded'] = True
+                dirty = True
+
+        for entry in os.scandir(work_dir):
+            if not entry.is_dir(): continue
+            name = entry.name
+            if len(name) < 10 or name[-9] != '_': continue
+            vid8 = name[-8:]
+            safe_title = name[:-9]
+            vid_dir = entry.path
+            final_path = os.path.join(vid_dir, f"{safe_title}_final.mp4")
+            if not os.path.isfile(final_path) or os.path.getsize(final_path) < 1024 * 1024:
+                continue
+
+            matched_vid = next((v for v in scan_cache if v[:8] == vid8), None)
+            vid = matched_vid or vid8
+
+            if vid in meta:
+                # 超5天未上传，自动标记已上传
+                m = meta[vid]
+                if not m.get('uploaded'):
+                    queued_at = m.get('queued_at') or 0
+                    if queued_at and (time.time() - queued_at) > 5 * 24 * 3600:
+                        meta[vid]['uploaded'] = True
+                        meta[vid]['uploaded_at'] = int(time.time())
+                        dirty = True
+                        logging.info(f"rescan_upload_queue: {vid} 入队超5天未上传，自动标记已上传")
+                continue  # Already in queue (uploaded or pending)
+
+            orig_title = scan_cache.get(vid, {}).get('title') or safe_title
+            thumb = None
+            for ext in ['webp', 'jpg', 'jpeg', 'png']:
+                t = os.path.join(vid_dir, f"{safe_title}.{ext}")
+                if os.path.exists(t): thumb = t; break
+
+            meta[vid] = {
+                'title': orig_title,
+                'original_title': orig_title,
+                'tid': cfg['bilibili'].get('tid', 122),
+                'tags': list(cfg['bilibili'].get('default_tags', [])),
+                'copyright': 1,
+                'source': f'https://www.youtube.com/watch?v={vid}',
+                'schedule_time': None,
+                'uploaded': False,
+                'local_path': final_path,
+                'original_thumbnail': thumb,
+                'url': f'https://www.youtube.com/watch?v={vid}',
+                'queued_at': int(os.path.getmtime(final_path)),
+                'stages': {
+                    'scan':      {'status': 'done',    'at': int(os.path.getmtime(final_path))},
+                    'download':  {'status': 'done',    'at': int(os.path.getmtime(final_path))},
+                    'transcode': {'status': 'done',    'at': int(os.path.getmtime(final_path))},
+                    'translate': {'status': 'pending', 'at': None},
+                    'upload':    {'status': 'pending', 'at': None},
+                },
+            }
+            added += 1
+
+        if added or dirty:
+            _save_video_meta(work_dir, meta)
+
+    # 每次都重建 S['transcoded']，确保过期/新增条目都反映到内存
+    restored = []
+    for vid, m in meta.items():
+        if m.get('uploaded'): continue
+        lp = m.get('local_path') or ''
+        if not lp or not os.path.isfile(lp): continue
+        restored.append({
+            'id': vid,
+            'title': m.get('original_title') or m.get('title', ''),
+            'translated_title': m.get('title', ''),
+            'description': '',
+            'url': m.get('url', f'https://www.youtube.com/watch?v={vid}'),
+            'url_type': 'video',
+            'already_downloaded': True,
+            'formats': [],
+            'rec_format_id': None,
+            'local_path': lp,
+            'local_dir': os.path.dirname(lp),
+            'original_thumbnail': m.get('original_thumbnail'),
+        })
+    with state_lock:
+        S['transcoded'] = restored
+        S['video_meta'] = {v: m for v, m in meta.items() if not m.get('uploaded')}
+    update_state()
+    logging.info(f"rescan_upload_queue: added {added} new videos, transcoded={len(restored)}.")
 
     return jsonify({'added': added})
 
@@ -1600,13 +1709,14 @@ def trigger_translate_single(vid):
             translated = cover_proc.translate_title(c['title'])
             if translated and translated != c['title']:
                 c['translated_title'] = translated
-                meta = _load_video_meta(work_dir)
-                if vid in meta:
-                    meta[vid]['title'] = translated
-                    _save_video_meta(work_dir, meta)
-                    with state_lock:
-                        if vid in S['video_meta']:
-                            S['video_meta'][vid]['title'] = translated
+                with _meta_lock:
+                    meta = _load_video_meta(work_dir)
+                    if vid in meta:
+                        meta[vid]['title'] = translated
+                        _save_video_meta(work_dir, meta)
+                with state_lock:
+                    if vid in S['video_meta']:
+                        S['video_meta'][vid]['title'] = translated
                 update_state()
                 log_to_web('info', f"重翻完成: {translated}", vid)
             else:
@@ -1692,32 +1802,33 @@ def prescan_meta(vid):
     data = request.json or {}
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
-    meta = _load_video_meta(work_dir)
-    if vid not in meta:
-        c = next((x for x in S['candidates'] if x['id'] == vid), {})
-        meta[vid] = {
-            'title': c.get('title', ''),
-            'original_title': c.get('title', ''),
-            'tid': cfg['bilibili'].get('tid', 122),
-            'tags': list(cfg['bilibili'].get('default_tags', [])),
-            'copyright': 1,
-            'source': c.get('url', ''),
-            'schedule_time': None,
-            'uploaded': False,
-            'local_path': None,
-            'url': c.get('url', ''),
-            'stages': {
-                'scan':      {'status': 'done',    'at': int(time.time())},
-                'download':  {'status': 'pending', 'at': None},
-                'transcode': {'status': 'pending', 'at': None},
-                'translate': {'status': 'pending', 'at': None},
-                'upload':    {'status': 'pending', 'at': None},
-            },
-        }
-    for key in ('schedule_time', 'tid', 'tags', 'copyright', 'cover_text'):
-        if key in data:
-            meta[vid][key] = data[key]
-    _save_video_meta(work_dir, meta)
+    with _meta_lock:
+        meta = _load_video_meta(work_dir)
+        if vid not in meta:
+            c = next((x for x in S['candidates'] if x['id'] == vid), {})
+            meta[vid] = {
+                'title': c.get('title', ''),
+                'original_title': c.get('title', ''),
+                'tid': cfg['bilibili'].get('tid', 122),
+                'tags': list(cfg['bilibili'].get('default_tags', [])),
+                'copyright': 1,
+                'source': c.get('url', ''),
+                'schedule_time': None,
+                'uploaded': False,
+                'local_path': None,
+                'url': c.get('url', ''),
+                'stages': {
+                    'scan':      {'status': 'done',    'at': int(time.time())},
+                    'download':  {'status': 'pending', 'at': None},
+                    'transcode': {'status': 'pending', 'at': None},
+                    'translate': {'status': 'pending', 'at': None},
+                    'upload':    {'status': 'pending', 'at': None},
+                },
+            }
+        for key in ('schedule_time', 'tid', 'tags', 'copyright', 'cover_text'):
+            if key in data:
+                meta[vid][key] = data[key]
+        _save_video_meta(work_dir, meta)
     with state_lock:
         S['video_meta'][vid] = meta[vid]
     return jsonify({'ok': True})
@@ -1837,6 +1948,9 @@ def jump_to_step(step):
         if S['status'].endswith('ing'):
             return jsonify({'error': 'Task is running, cannot jump'}), 409
         target = _JUMP_TARGET[step]
+        # Don't demote to scan_done if transcoded videos still exist
+        if target == 'scan_done' and S.get('transcoded'):
+            target = 'pipeline_done'
         S['status'] = target
     broadcast('state', {k: S[k] for k in S if k != 'current_task'})
     return jsonify({'ok': True, 'status': target})
@@ -1999,43 +2113,44 @@ def add_source():
 
             # Mark already-uploaded videos and write video_meta for new ones
             history = get_history()
-            um = _load_video_meta(work_dir)
-            skipped_ids = set()
-            for c in new_candidates:
-                vid = c['id']
-                already_uploaded = (
-                    vid in history or
-                    um.get(vid, {}).get('uploaded') or
-                    um.get(vid, {}).get('stages', {}).get('upload', {}).get('status') == 'done'
-                )
-                if already_uploaded:
-                    c['already_uploaded'] = True
-                    skipped_ids.add(vid)
-                else:
-                    # Write video_meta entry if not already present
-                    if vid not in um:
-                        um[vid] = {
-                            'title': c.get('title', ''),
-                            'original_title': c.get('title', ''),
-                            'tid': cfg['bilibili'].get('tid', 122),
-                            'tags': list(cfg['bilibili'].get('default_tags', [])),
-                            'copyright': 1,
-                            'source': c['url'],
-                            'schedule_time': None,
-                            'uploaded': False,
-                            'local_path': None,
-                            'original_thumbnail': None,
-                            'url': c['url'],
-                            'queued_at': int(time.time()),
-                            'stages': {
-                                'scan':      {'status': 'done',    'at': int(time.time())},
-                                'download':  {'status': 'pending', 'at': None},
-                                'transcode': {'status': 'pending', 'at': None},
-                                'translate': {'status': 'pending', 'at': None},
-                                'upload':    {'status': 'pending', 'at': None},
-                            },
-                        }
-            _save_video_meta(work_dir, um)
+            with _meta_lock:
+                um = _load_video_meta(work_dir)
+                skipped_ids = set()
+                for c in new_candidates:
+                    vid = c['id']
+                    already_uploaded = (
+                        vid in history or
+                        um.get(vid, {}).get('uploaded') or
+                        um.get(vid, {}).get('stages', {}).get('upload', {}).get('status') == 'done'
+                    )
+                    if already_uploaded:
+                        c['already_uploaded'] = True
+                        skipped_ids.add(vid)
+                    else:
+                        # Write video_meta entry if not already present
+                        if vid not in um:
+                            um[vid] = {
+                                'title': c.get('title', ''),
+                                'original_title': c.get('title', ''),
+                                'tid': cfg['bilibili'].get('tid', 122),
+                                'tags': list(cfg['bilibili'].get('default_tags', [])),
+                                'copyright': 1,
+                                'source': c['url'],
+                                'schedule_time': None,
+                                'uploaded': False,
+                                'local_path': None,
+                                'original_thumbnail': None,
+                                'url': c['url'],
+                                'queued_at': int(time.time()),
+                                'stages': {
+                                    'scan':      {'status': 'done',    'at': int(time.time())},
+                                    'download':  {'status': 'pending', 'at': None},
+                                    'transcode': {'status': 'pending', 'at': None},
+                                    'translate': {'status': 'pending', 'at': None},
+                                    'upload':    {'status': 'pending', 'at': None},
+                                },
+                            }
+                _save_video_meta(work_dir, um)
 
             # Filter out already-uploaded from candidates to add
             new_candidates_to_add = [c for c in new_candidates if c['id'] not in skipped_ids]
@@ -2104,10 +2219,35 @@ def list_history():
 
 @app.route('/api/video_meta', methods=['GET'])
 def get_video_meta_all():
-    """返回 video_meta.json 全量数据（含已上传条目），供日历视图使用。"""
+    """返回 video_meta.json 全量数据（含已上传条目），供日历视图使用。
+    同时把 history.json 里有但 video_meta 里没有的条目补充进去（用文件 mtime 作为 uploaded_at）。"""
     cfg = load_config()
     work_dir = cfg['app']['work_dir']
     meta = _load_video_meta(work_dir)
+    scan_cache = _load_scan_cache(work_dir)
+    hist_ids = get_history()
+
+    for vid in hist_ids:
+        if vid in meta:
+            continue  # 已在 video_meta 里，不覆盖
+        uploaded_at = None
+        title = scan_cache.get(vid, {}).get('title') or vid
+        # 目录名格式: {slugified_title}_{vid[:8]}
+        vid8 = vid[:8]
+        if os.path.isdir(work_dir):
+            for entry in os.scandir(work_dir):
+                if entry.is_dir() and entry.name.endswith('_' + vid8):
+                    safe_title = entry.name[: -(len(vid8) + 1)]
+                    fp = os.path.join(entry.path, f"{safe_title}_final.mp4")
+                    if os.path.isfile(fp):
+                        uploaded_at = int(os.path.getmtime(fp))
+                    break
+        meta[vid] = {
+            'title': title,
+            'uploaded': True,
+            'uploaded_at': uploaded_at,
+        }
+
     return jsonify(meta)
 
 @app.route('/api/thumb/<vid>')
@@ -2119,6 +2259,8 @@ def get_thumb(vid):
     app_root = os.path.dirname(os.path.abspath(__file__))
 
     def resolve(path):
+        if not path:
+            return None
         if not os.path.isabs(path):
             path = os.path.normpath(os.path.join(app_root, path))
         return path if os.path.isfile(path) else None

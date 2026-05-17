@@ -276,6 +276,7 @@ function renderActionPanel(sm) {
       </div>
       <div class="action-footer">
         ${pendingCnt ? `<button class="btn btn-green" onclick="doUploadAll()">🚀 全部上传</button>` : ''}
+        <button class="btn btn-ghost" onclick="showScheduleModal()">📅 自动排班</button>
         <button class="btn btn-ghost" onclick="doTranslate()">🌐 重新翻译全部</button>
         <button class="btn btn-ghost" onclick="doRescan()">🔍 重新扫描队列</button>
         <button class="btn btn-ghost" onclick="doScan()">重新扫描来源</button>
@@ -640,6 +641,7 @@ function renderVideoSection() {
         const defaultDtUnix = Math.floor((Date.now() + 5 * 3600 * 1000) / 1000);
         const minDtLocal = schedTimeToInputVal(Math.floor((Date.now() + 4 * 3600 * 1000 + 60000) / 1000));
         const scheduledInputVal = m.schedule_time ? schedTimeToInputVal(m.schedule_time) : schedTimeToInputVal(defaultDtUnix);
+        const editor = document.createElement('div');
         editor.className = 'upload-meta-editor' + (metaExp ? '' : ' collapsed');
         editor.innerHTML = `
           <div class="meta-field">
@@ -1055,8 +1057,13 @@ async function doRetry(id)     { await api('POST', '/api/retry', { video_id: id 
 
 // ── Schedule modal (auto-assign publish times) ─────────────────────────────
 function showScheduleModal() {
-  const ids = [...selectedIds].filter(id => !S.candidates.find(c => c.id === id)?.already_downloaded);
-  if (!ids.length) { alert('请先勾选要排班的视频'); return; }
+  let ids = [...selectedIds].filter(id => !S.candidates.find(c => c.id === id)?.already_downloaded);
+  // In pipeline_done state, no checkboxes — use all pending (not yet uploaded) transcoded videos
+  if (!ids.length) {
+    const uploaded = new Set((S.uploaded || []).map(u => u.id));
+    ids = (S.transcoded || []).filter(c => !uploaded.has(c.id)).map(c => c.id);
+  }
+  if (!ids.length) { alert('没有待排班的视频'); return; }
 
   // Fixed slots: 12:00, 18:00, 22:00 — find next available slot from now
   const SLOTS = [12, 18, 22]; // hours
@@ -1447,11 +1454,11 @@ function renderCalendar() {
   for (const [vid, m] of Object.entries(Cal.meta || {})) {
     let dt = null;
     if (m.schedule_time) {
-      dt = new Date(m.schedule_time);
-    } else if (m.uploaded && m.uploaded_at) {
-      dt = new Date(m.uploaded_at * 1000);
+      dt = new Date(m.schedule_time * 1000);
+    } else if (!m.uploaded) {
+      // 未上传且无 schedule_time → 放入待排班托盘
     }
-    if (!dt || isNaN(dt)) { unscheduled.push({vid, m}); continue; }
+    if (!dt || isNaN(dt)) { if (!m.uploaded) unscheduled.push({vid, m}); continue; }
 
     const dateKey = `${dt.getFullYear()}-${String(dt.getMonth()+1).padStart(2,'0')}-${String(dt.getDate()).padStart(2,'0')}`;
     const key = `${dateKey}|${dt.getHours()}`;

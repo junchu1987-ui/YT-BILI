@@ -54,7 +54,7 @@ class CoverProcessor:
             "role": "user",
             "content": (
                 "将以下YouTube视频标题翻译成中文，使用中国大陆日常口语表达，"
-                "专有名词用国内常见叫法（如scooter译为电瓶车/摩托车，根据语境判断）。"
+                "专有名词用国内常见叫法。"
                 "只输出翻译结果，不要解释：\n"
                 f"{title}"
             )
